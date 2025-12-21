@@ -147,45 +147,49 @@ def copy_rows_to_toxicity(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row],
     return cur.rowcount if cur.rowcount is not None else 0
 
 
-def copy_rows_to_gemini(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row], table: str = "gemini_segments") -> int:
+def copy_rows_to_gemini(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row], table: str) -> int:
     ensure_gemini_table(conn, table)
-    def _val(row, key):
-        try:
-            return row[key]
-        except Exception:
-            return row.get(key)
     payload = [
         (
             r["id"],
             r["parent_digest"],
             r["text"],
             r["norm_hash"],
-            _val(r, "toxicity_label"),
-            _val(r, "toxicity_score"),
-            _val(r, "gemini_json"),
-            _val(r, "gemini_error"),
+            r.get("toxicity_label"),
+            r.get("toxicity_score"),
+            r.get("gemini_json"),
         )
         for r in rows
     ]
-    sql = f"INSERT OR REPLACE INTO {_validate_table_name(table)} (id, parent_digest, text, norm_hash, toxicity_label, toxicity_score, gemini_json, gemini_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    sql = f"INSERT OR REPLACE INTO {_validate_table_name(table)} (id, parent_digest, text, norm_hash, toxicity_label, toxicity_score, gemini_json) VALUES (?, ?, ?, ?, ?, ?, ?)"
     cur = conn.executemany(sql, payload)
     return cur.rowcount if cur.rowcount is not None else 0
+
+
+def ensure_llm_table(conn: sqlite3.Connection, table: str = "llm_segments") -> None:
+    """
+    Mirror gemini table; used for offline LLM scoring to keep results separate.
+    """
+    ensure_gemini_table(conn, table)
 
 
 def iterate_table(
     conn: sqlite3.Connection, table: str, batch_size: int = 1000
 ) -> Generator[List[sqlite3.Row], None, None]:
+    """
+    Stream rows from a table by rowid with forward-only pagination.
+    """
     table = _validate_table_name(table)
     last_rowid = 0
     while True:
         rows = conn.execute(
-            f"SELECT rowid as __rowid__, * FROM {table} WHERE rowid > ? ORDER BY rowid LIMIT ?",
+            f"SELECT rowid as __rowid__, * FROM {table} WHERE rowid > ? and toxicity_label != 1 ORDER BY rowid LIMIT ?",
             (last_rowid, batch_size),
         ).fetchall()
         if not rows:
             break
-        yield rows
         last_rowid = rows[-1]["__rowid__"]
+        yield rows
 
 
 def collect_ids(conn: sqlite3.Connection, table: str) -> Set[str]:

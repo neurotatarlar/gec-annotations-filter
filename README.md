@@ -25,7 +25,7 @@ python -m app.cli ingest --dataset yasalma/vk-messages --split train --output-ta
 
 2) **Deduplicate (exact + SimHash near-dups)**
 ```bash
-python -m app.cli dedup --source-table clean_segments --output-table dedup_segments --distance 3
+python -m app.cli dedup --source-table clean_segments --output-table dedup_segments --distance 1
 # reports default to reports/dedup_report.json
 ```
 
@@ -36,8 +36,10 @@ python -m app.cli toxicity --source-table dedup_segments --output-table toxicity
 # To drop above a threshold: add --threshold 0.5
 ```
 
+5) **LLM scoring (Gemini API or manual copy/paste)**
 4) **Gemini scoring (optional)**
 ```bash
+python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --model models/gemini-2.5-flash ; spd-say complete 
 python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --keys-path data/gemini_keys.yaml --model models/gemini-1.5-flash
 # custom prompt: --prompt-path path/to/prompt.txt
 ```
@@ -58,6 +60,7 @@ python -m app.cli prepare-import --source-table llm_segments --limit 5000 data/i
 Notes:
 - Use `--source-table`/`--output-table` to chain stages without mutating inputs; tables must differ.
 - `ingest` skips rows already logged for the same dataset+output table (ingest_log) so re-runs only add new rows.
+- LLM scoring writes to `llm_segments` by default, whether via Gemini API or `llm-step`.
 - `prepare-import` is incremental: it records exported ids in `export_log` and only writes new eligible rows on rerun.
 - Gemini scoring adapts batch size on timeouts and marks `gemini_skipped` rows if a single item repeatedly times out.
 - Safe for incremental updates: `ingest`, `dedup`, `toxicity`, `gemini`, `prepare-import`. `export` always writes a full parquet snapshot.
