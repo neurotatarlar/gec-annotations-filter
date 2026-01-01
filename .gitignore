@@ -3,3 +3,5 @@ reports/*
 data/*
 .venv
 app/__pycache__/*
+app/data/gemini_keys.yaml
+app/data/gemini_keys.yaml.expired
