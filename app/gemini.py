@@ -321,9 +321,9 @@ def call_gemini(
     model,
     prompt: str,
     schema,
-) -> str:
+) -> tuple[str, Optional[Any]]:
     """
-    Call Gemini and return the raw text response. Caller should parse JSON.
+    Call Gemini and return the raw text response and usage metadata. Caller should parse JSON.
     """
     config = types.GenerateContentConfig(
         temperature=0.1,
@@ -339,7 +339,7 @@ def call_gemini(
             contents=[prompt],
             config=config,
         )
-        return resp.text
+        return resp.text, getattr(resp, "usage_metadata", None)
     except Exception as exc:  # pragma: no cover - network/runtime
         raise exc  # type: ignore
 

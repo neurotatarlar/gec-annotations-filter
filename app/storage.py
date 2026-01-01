@@ -74,11 +74,16 @@ def ensure_toxicity_table(conn: sqlite3.Connection, table: str = "toxicity_segme
             text TEXT NOT NULL,
             norm_hash TEXT NOT NULL UNIQUE,
             toxicity_label INTEGER,
-            toxicity_score REAL
+            toxicity_score REAL,
+            gemini_skipped INTEGER DEFAULT 0
         )
         """
     )
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_parent ON {table}(parent_digest)")
+    # Ensure new columns exist for older DBs
+    existing_cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if "gemini_skipped" not in existing_cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN gemini_skipped INTEGER DEFAULT 0")
 
 
 def ensure_gemini_table(conn: sqlite3.Connection, table: str = "gemini_segments") -> None:
@@ -98,6 +103,23 @@ def ensure_gemini_table(conn: sqlite3.Connection, table: str = "gemini_segments"
         """
     )
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_parent ON {table}(parent_digest)")
+
+
+def ensure_export_log_table(conn: sqlite3.Connection) -> None:
+    """
+    Track which ids have been exported for a given target to avoid duplicates on reruns.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS export_log (
+            id TEXT NOT NULL,
+            target TEXT NOT NULL,
+            exported_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            PRIMARY KEY (id, target)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_export_log_target ON export_log(target)")
 
 
 def insert_clean_segments(conn: sqlite3.Connection, segments: Sequence[ProcessedSegment], table: str = "clean_segments") -> int:

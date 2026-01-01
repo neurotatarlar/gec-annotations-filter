@@ -1,11 +1,14 @@
 import json
 import hashlib
+import random
+import re
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 import sqlite3
 from pydantic import TypeAdapter
+import time
 
 import datasets
 import polars as pl
@@ -33,7 +36,8 @@ from .gemini import (
     call_gemini,
     load_keys,
     build_batch_prompt,
-    ScoredItem
+    ScoredItem,
+    LabelPayload,
 )
 from .processing import (
     ProcessedSegment,
@@ -46,6 +50,8 @@ from .storage import (
     copy_rows_to_gemini,
     copy_rows_to_toxicity,
     ensure_llm_table,
+    ensure_gemini_table,
+    ensure_export_log_table,
     collect_ids,
     ensure_ingest_log_table,
     insert_clean_segments,
@@ -57,7 +63,6 @@ from .storage import (
     try_log_row,
 )
 from .toxicity import load_toxicity_pipeline, predict_toxicity
-
 
 # Utility helpers
 def ensure_parent(path: Path) -> None:
@@ -351,6 +356,9 @@ def gemini_cmd(
     report_path: Optional[Path],
 ):
     from collections import Counter
+    from rich.console import Console
+    
+    console = Console()
 
     ensure_parent(db_path)
     prompt = DEFAULT_PROMPT
@@ -376,13 +384,40 @@ def gemini_cmd(
     expired_keys = _load_expired()
     keys = [k for k in load_keys(keys_path) if k not in expired_keys]
     if not keys:
-        typer.echo("No usable Gemini keys after filtering expired keys.")
+        console.print("No usable Gemini keys after filtering expired keys.")
         raise typer.Exit(code=1)
     rotator = KeyRotator(keys)
     stats = Counter()
     processed = 0
     stop = False
     batch_size = max(1, batch_size)
+    token_totals = Counter()
+
+    def _usage_val(usage, key: str) -> int:
+        if usage is None:
+            return 0
+        if isinstance(usage, dict):
+            try:
+                return int(usage.get(key) or 0)
+            except Exception:
+                return 0
+        try:
+            return int(getattr(usage, key, 0) or 0)
+        except Exception:
+            return 0
+
+    def _record_usage(usage) -> None:
+        prompt_tokens = _usage_val(usage, "prompt_token_count")
+        output_tokens = _usage_val(usage, "candidates_token_count")
+        total_tokens = _usage_val(usage, "total_token_count")
+        token_totals["input"] += prompt_tokens
+        token_totals["output"] += output_tokens
+        token_totals["total"] += total_tokens
+        token_totals["requests"] += 1
+        console.print(
+            f"Gemini tokens: input={prompt_tokens}, output={output_tokens}, total={total_tokens}",
+            style='green',
+        )
 
     def score_chunk(chunk: List[Dict]) -> Tuple[Dict[str, Dict], Optional[str]]:
         last_error: Optional[str] = None
@@ -394,87 +429,149 @@ def gemini_cmd(
             try:
                 client = genai.Client(api_key=key)
                 prompt_text = build_batch_prompt(prompt, [{"id": r["id"], "text": r["text"]} for r in chunk])
-                print(prompt_text)
-                resp_text = call_gemini(client, model, prompt_text, schema=list[ScoredItem])
-                print(resp_text)
+                # console.print(prompt_text, style="honeydew2")
+                resp_text, usage = call_gemini(client, model, prompt_text, schema=list[ScoredItem])
+                # console.print(resp_text, style="thistle1")
+                _record_usage(usage)
                 ta = TypeAdapter(List[ScoredItem])
-                return ta.validate_python(json.loads(resp_text))
+                res = ta.validate_python(json.loads(resp_text))
+                time.sleep(5)
+                return res
             except Exception as exc:  # pragma: no cover - network errors
+                import traceback
                 last_error = str(exc)
                 if "UNAVAILABLE" in last_error or "overloaded" in last_error.lower():
-                    typer.echo("Gemini overloaded (503). Sleeping 60s before retry...")
+                    console.print("Gemini overloaded (503). Sleeping 60s before retry...")
                     time.sleep(60)
                     continue
                 if "DEADLINE_EXCEEDED" in last_error or "timed out" in last_error.lower():
-                    typer.echo("Gemini timed out (504); retrying with next key...")
-                    continue
+                    console.print(f"Gemini timed out (504) on chunk size {len(chunk)}; will reduce batch size.")
+                    raise TimeoutError(last_error)
                 if "RESOURCE_EXHAUSTED" in last_error or "quota" in last_error.lower():
-                    typer.echo(f"Key appears exhausted; marking as expired: {key}")
+                    console.print(f"Key appears exhausted; marking as expired: {key}")
+                    traceback.print_exc()
                     expired_keys.add(key)
                     _save_expired(expired_keys)
                     keys = [k for k in keys if k != key]
                     if not keys:
-                        typer.echo("All Gemini keys exhausted.")
-                        return {}, last_error
+                        console.print("All Gemini keys exhausted.")
+                        raise typer.Exit(code=1)
                     rotator = KeyRotator(keys)
+                    time.sleep(5)
                     continue
-                raise exc
+                traceback.print_exc()
+                time.sleep(5)
+                continue
+        if last_error and ("DEADLINE_EXCEEDED" in last_error or "timed out" in last_error.lower()):
+            raise TimeoutError(last_error)
         return {}, last_error
 
     with open_db(db_path) as conn:
+        if source_table == "toxicity_segments":
+            ensure_toxicity_table(conn, source_table)
         ensure_llm_table(conn, output_table)
-        existing_ids = collect_ids(conn, output_table)
-        for rows in track(iterate_table(conn, source_table, batch_size), description="Scoring by Gemini"):
-            pending_rows = []
-            for row in rows:
-                row_d = dict(row)
-                if row_d["id"] in existing_ids:
-                    continue
-                if row_d.get("toxicity_label") == 1:
-                    continue
-                pending_rows.append(row_d)
-            accepted: List[Dict] = []
-            idx = 0
-            while idx < len(pending_rows):
+        pending_sql = f"""
+        SELECT s.*
+        FROM {source_table} AS s
+        LEFT JOIN {output_table} AS o ON s.id = o.id
+        WHERE o.id IS NULL AND COALESCE(s.toxicity_label, 0) != 1 AND COALESCE(s.gemini_skipped,0)=0
+        ORDER BY s.rowid
+        LIMIT ?
+        """
+        chunk_num = 0
+        current_batch_size = max(1, batch_size)
+        try:
+            while True:
                 if max_rows and processed >= max_rows:
-                    stop = True
+                    console.print("Reached max_rows limit.")
                     break
-                chunk = pending_rows[idx : idx + batch_size]
-                processed += len(chunk)
-                stats["rows_total"] += len(chunk)
 
-                scored_items = {s.id: s.labels for s in score_chunk(chunk)}
+                rows = conn.execute(pending_sql, (current_batch_size,)).fetchall()
+                if not rows:
+                    console.print("No more rows to process.")
+                    break
 
-                for row in chunk:
-                    payload = scored_items.get(str(row["id"]))
-                    if not payload:
+                chunk = [dict(r) for r in rows]
+                console.print(
+                    f"Sending chunk {chunk_num + 1} with batch_size={len(chunk)} (current limit={current_batch_size})"
+                )
+                try:
+                    chunk_num += 1
+                    accepted: List[Dict] = []
+                    scored_items = {s.id: s.labels for s in score_chunk(chunk) if hasattr(s, "id") and hasattr(s, "labels")}
+
+                    processed += len(chunk)
+                    stats["rows_total"] += len(chunk)
+
+                    for row in chunk:
+                        payload = scored_items.get(str(row["id"]))
+                        if not payload:
+                            continue
+                        row_data = dict(row)
+                        row_data["gemini_json"]=payload.model_dump_json(indent=None, by_alias=True, exclude_none=True, exclude_unset=True, ensure_ascii=False)
+                        if payload:
+                            stats["rows_ok"] += 1
+                        else:
+                            stats["errors"] += 1
+                        accepted.append(row_data)
+
+                    chunk_matched = len(accepted)
+                    chunk_missing = len(chunk) - chunk_matched
+                    console.print(
+                        f"Chunk {chunk_num} processed: total={len(chunk)}, matched={chunk_matched}, missing={chunk_missing}, cumulative_ok={stats.get('rows_ok',0)}"
+                    )
+
+                    if accepted:
+                        copy_rows_to_gemini(conn, accepted, output_table)
+                        conn.commit()
+
+                    if stop:
+                        break
+                except TimeoutError:
+                    if current_batch_size > 1:
+                        current_batch_size = max(1, current_batch_size // 2)
+                        console.print(f"Timeout encountered; reducing batch size to {current_batch_size}")
                         continue
-                    row_data = dict(row)
-                    row_data["gemini_json"]=payload.model_dump_json(indent=None, by_alias=True, exclude_none=True, exclude_unset=True, ensure_ascii=False)
-                    if payload:
-                        stats["rows_ok"] += 1
                     else:
-                        stats["errors"] += 1
-                    accepted.append(row_data)
+                        # batch size already 1; mark these rows as skipped
+                        ids_to_skip = [r["id"] for r in rows]
+                        conn.executemany(
+                            f"UPDATE {source_table} SET gemini_skipped=1 WHERE id=?",
+                            [(rid,) for rid in ids_to_skip],
+                        )
+                        conn.commit()
+                        console.print(f"Marked {len(ids_to_skip)} rows as gemini_skipped after repeated timeouts.")
+                        current_batch_size = 1
+                        continue
+        finally:
+            reqs = token_totals.get("requests", 0)
+            if reqs:
+                prompt_total = token_totals.get("input", 0)
+                output_total = token_totals.get("output", 0)
+                total_total = token_totals.get("total", 0)
+                console.print(
+                    f"Gemini token usage totals: requests={reqs}, input={prompt_total}, output={output_total}, total={total_total}",
+                    style='green',
+                )
+                console.print(
+                    "Gemini token usage averages: "
+                    f"input={prompt_total/reqs:.2f}, output={output_total/reqs:.2f}, total={total_total/reqs:.2f}",
+                    style='green',
+                )
+            else:
+                console.print("Gemini token usage: no requests made.", style='green')
 
-                idx += len(chunk)
-
-            if accepted:
-                copy_rows_to_gemini(conn, accepted, output_table)
-
-            if stop:
-                break
-
-    typer.echo(
-        f"Gemini scoring finished; processed {processed} rows; ok={stats.get('rows_ok',0)}, errors={stats.get('errors',0)}"
+    console.print(
+        f"Gemini scoring finished; processed {processed} rows; ok={stats.get('rows_ok',0)}, errors={stats.get('errors',0)}",
+        style='green',
     )
     if report_path:
         ensure_parent(report_path)
         report_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
-        typer.echo(f"Wrote Gemini report to {report_path}")
+        console.print(f"Wrote Gemini report to {report_path}")
 
 
-def export_cmd(
+def export_parquet_cmd(
     db_path: Path,
     output: Path,
     table: str,
@@ -506,3 +603,174 @@ def _stream_table_to_parquet(
             writer.write_table(batch.to_arrow())
             written += len(rows)
     return written
+
+
+def prepare_import_cmd(
+    db_path: Path,
+    source_table: str,
+    output: Path,
+    limit: Optional[int],
+    extreme_share: float,
+    dry_run: bool = False,
+    keep_proportions: bool = False,
+):
+    """
+    Produce a JSON array of {id, text} ready for annotation, with basic quality filters,
+    non-toxic only, and a small proportion of low/high error_density examples.
+    """
+    extreme_share = max(0.0, min(0.5, extreme_share))
+    ensure_parent(db_path)
+    if not dry_run:
+        ensure_parent(output)
+
+    allowed_langs = {"tatar", "mixed"}
+    ta_label = TypeAdapter(LabelPayload)
+    target = "prepare_import"
+
+    with open_db(db_path) as conn:
+        ensure_gemini_table(conn, source_table)
+        ensure_export_log_table(conn)
+
+        exported_ids = {
+            row["id"]
+            for row in conn.execute("SELECT id FROM export_log WHERE target = ?", (target,)).fetchall()
+        }
+
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({source_table})")}
+        has_gemini_skipped = "gemini_skipped" in columns
+        skip_clause = "AND COALESCE(s.gemini_skipped,0)=0" if has_gemini_skipped else ""
+
+        rows = conn.execute(
+            f"""
+            SELECT s.id, s.text, s.gemini_json
+            FROM {source_table} AS s
+            WHERE s.gemini_json IS NOT NULL
+              AND COALESCE(s.toxicity_label, 0) = 0
+              {skip_clause}
+            ORDER BY s.rowid
+            """
+        ).fetchall()
+
+        buckets = {"low": [], "medium": [], "high": []}
+        skipped = 0
+        for row in rows:
+            if row["id"] in exported_ids:
+                continue
+            try:
+                labels = ta_label.validate_json(row["gemini_json"])
+            except Exception:
+                skipped += 1
+                continue
+            if labels.main_language not in allowed_langs:
+                continue
+            if labels.noise_score > 0.35:
+                continue
+            if labels.meaning_clarity < 0.35:
+                continue
+            if labels.overall_gec_usefulness < 0.4:
+                continue
+            density = labels.error_density
+            if density not in buckets:
+                continue
+            score = (
+                0.50 * labels.overall_gec_usefulness
+                + 0.20 * labels.meaning_clarity
+                + 0.15 * labels.tatar_prob
+                + 0.10 * labels.error_share
+                + 0.05 * labels.non_fluent_prob
+                - 0.20 * labels.noise_score
+            )
+            buckets[density].append({"id": row["id"], "text": row["text"], "score": score})
+
+        total_candidates = sum(len(v) for v in buckets.values())
+        if total_candidates == 0:
+            typer.echo("No candidates available for prepare_import after filtering.")
+            return
+
+        if not keep_proportions and limit is None:
+            selected_med = sorted(buckets["medium"], key=lambda x: (-x["score"], x["id"]))
+            selected_low = sorted(buckets["low"], key=lambda x: (-x["score"], x["id"]))
+            selected_high = sorted(buckets["high"], key=lambda x: (-x["score"], x["id"]))
+            selected = selected_med + selected_low + selected_high
+            if dry_run:
+                typer.echo(
+                    f"Dry-run prepare_import: total_candidates={total_candidates}, selected={len(selected)} "
+                    f"(med={len(selected_med)}, low={len(selected_low)}, high={len(selected_high)}), skipped_invalid={skipped}"
+                )
+                return
+            random.shuffle(selected)
+            output_data = [{"id": r["id"], "text": r["text"]} for r in selected]
+            output.write_text(json.dumps(output_data, ensure_ascii=False, indent=2), encoding="utf-8")
+            typer.echo(f"Wrote {len(selected)} rows to {output} (skipped {skipped} invalid Gemini payloads).")
+            typer.echo(
+                f"Selection breakdown: medium={len(selected_med)}, low={len(selected_low)}, high={len(selected_high)}; "
+                f"kept_proportions={keep_proportions}, limit={limit or 'none'}"
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO export_log (id, target) VALUES (?, ?)",
+                [(r["id"], target) for r in selected],
+            )
+            conn.commit()
+            return
+
+        target_total = limit if limit is not None else total_candidates
+        target_total = max(0, target_total)
+        share = extreme_share
+        low_target = min(len(buckets["low"]), int(round(target_total * share)))
+        high_target = min(len(buckets["high"]), int(round(target_total * share)))
+        remaining = max(0, target_total - low_target - high_target)
+        med_target = min(len(buckets["medium"]), remaining)
+        remaining -= med_target
+
+        sorted_low = sorted(buckets["low"], key=lambda x: (-x["score"], x["id"]))
+        sorted_high = sorted(buckets["high"], key=lambda x: (-x["score"], x["id"]))
+        sorted_med = sorted(buckets["medium"], key=lambda x: (-x["score"], x["id"]))
+
+        selected_low = sorted_low[:low_target]
+        selected_high = sorted_high[:high_target]
+        selected_med = sorted_med[:med_target]
+
+        if not keep_proportions and remaining > 0:
+            # fill from leftover low/high evenly
+            low_left = sorted_low[low_target:]
+            high_left = sorted_high[high_target:]
+            take_more_low = min(len(low_left), (remaining + 1) // 2)
+            take_more_high = min(len(high_left), remaining - take_more_low)
+            selected_low += low_left[:take_more_low]
+            selected_high += high_left[:take_more_high]
+            remaining -= take_more_low + take_more_high
+
+        selected = selected_med + selected_low + selected_high
+        if not keep_proportions and remaining > 0 and len(selected) < target_total:
+            # If still short, fill from any remaining medium first, then others.
+            med_left = sorted_med[med_target:]
+            extra = med_left[:remaining]
+            selected += extra
+
+        selected = selected[:target_total]
+
+        if not selected:
+            typer.echo("No rows selected for prepare_import.")
+            return
+
+        if dry_run:
+            typer.echo(
+                f"Dry-run prepare_import: total_candidates={total_candidates}, selected={len(selected)} "
+                f"(med={len(selected_med)}, low={len(selected_low)}, high={len(selected_high)}), skipped_invalid={skipped}"
+            )
+            return
+
+        random.shuffle(selected)
+        output_data = [{"id": r["id"], "text": r["text"]} for r in selected]
+        output.write_text(json.dumps(output_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        typer.echo(f"Wrote {len(selected)} rows to {output} (skipped {skipped} invalid Gemini payloads).")
+        typer.echo(
+            f"Selection breakdown: medium={len(selected_med)}, low={len(selected_low)}, high={len(selected_high)}; "
+            f"kept_proportions={keep_proportions}, limit={limit or 'none'}"
+        )
+
+        conn.executemany(
+            "INSERT OR IGNORE INTO export_log (id, target) VALUES (?, ?)",
+            [(r["id"], target) for r in selected],
+        )
+        conn.commit()

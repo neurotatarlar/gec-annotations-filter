@@ -8,7 +8,8 @@ from .commands import (
     dedup_cmd,
     toxicity_cmd,
     gemini_cmd,
-    export_cmd,
+    export_parquet_cmd,
+    prepare_import_cmd,
 )
 from .config import DEFAULT_CONFIG
 
@@ -74,7 +75,7 @@ def gemini_score(
 
 
 @app.command()
-def export(
+def export_parquet(
     db_path: Path = typer.Option(Path("data/pipeline.sqlite"), "--db-path", help="Existing sqlite database."),
     output: Path = typer.Argument(..., help="Destination parquet file."),
     table: str = typer.Option(
@@ -82,7 +83,20 @@ def export(
         help="Table to export. Will fall back to dedup_segments if empty.",
     ),
 ):
-    export_cmd(db_path, output, table)
+    export_parquet_cmd(db_path, output, table)
+
+
+@app.command("prepare-import")
+def prepare_import(
+    db_path: Path = typer.Option(Path("data/pipeline.sqlite"), "--db-path", help="Existing sqlite database."),
+    source_table: str = typer.Option("llm_segments", help="Gemini-scored table to read from."),
+    output: Path = typer.Option('data/import.json',  help="Destination JSON file containing array of {{id, text}}."),
+    limit: Optional[int] = typer.Option(None, help="Optional maximum number of items to include."),
+    extreme_share: float = typer.Option(0.15, help="Share (0-0.5) for low/high error_density buckets."),
+    dry_run: bool = typer.Option(False, help="If true, just report counts without writing or marking exported."),
+    keep_proportions: bool = typer.Option(True, help="If true, preserve low/medium/high proportions even if total is smaller."),
+):
+    prepare_import_cmd(db_path, source_table, output, limit, extreme_share, dry_run, keep_proportions)
 
 
 if __name__ == "__main__":
