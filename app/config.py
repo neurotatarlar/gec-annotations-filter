@@ -24,8 +24,8 @@ class ProcessingConfig:
         "Comment is not in text format.",
     )  # Exact strings considered system noise to drop.
     near_dup_distance: int = 2  # Default SimHash distance for near-duplicate removal.
-    name_list_path: Path = Path(__file__).parent / "data" / "tatar_names.json"  # Placeholder name replacements.
-    gemini_keys_path: Path = Path(__file__).parent / "data" / "gemini_keys.yaml"  # Location of Gemini API keys file.
+    name_list_path: Path = Path(__file__).resolve().parents[1] / "data" / "tatar_names.json"  # Placeholder name replacements.
+    gemini_keys_path: Path = Path(__file__).resolve().parents[1] / "data" / "gemini_keys.yaml"  # Location of Gemini API keys file.
     gemini_model: str = "models/gemini-3-flash-preview"  # Default Gemini model identifier.
 
 

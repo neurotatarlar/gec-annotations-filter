@@ -1,7 +1,8 @@
 reports/*
 .idea
 data/*
+!data/tatar_names.json
 .venv
 app/__pycache__/*
-app/data/gemini_keys.yaml
-app/data/gemini_keys.yaml.expired
+commands.txt
+data

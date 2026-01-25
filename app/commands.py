@@ -1,4 +1,5 @@
 import json
+import math
 import hashlib
 import random
 import re
@@ -392,6 +393,12 @@ def gemini_cmd(
     stop = False
     batch_size = max(1, batch_size)
     token_totals = Counter()
+    max_batch_size = max(1, batch_size)
+    success_streak = 0
+    success_threshold = 5
+
+    class ResponseParseError(RuntimeError):
+        pass
 
     def _usage_val(usage, key: str) -> int:
         if usage is None:
@@ -434,9 +441,14 @@ def gemini_cmd(
                 # console.print(resp_text, style="thistle1")
                 _record_usage(usage)
                 ta = TypeAdapter(List[ScoredItem])
-                res = ta.validate_python(json.loads(resp_text))
+                try:
+                    res = ta.validate_python(json.loads(resp_text))
+                except Exception as exc:
+                    raise ResponseParseError(str(exc)) from exc
                 time.sleep(5)
                 return res
+            except ResponseParseError:
+                raise
             except Exception as exc:  # pragma: no cover - network errors
                 import traceback
                 last_error = str(exc)
@@ -479,7 +491,7 @@ def gemini_cmd(
         LIMIT ?
         """
         chunk_num = 0
-        current_batch_size = max(1, batch_size)
+        current_batch_size = max_batch_size
         try:
             while True:
                 if max_rows and processed >= max_rows:
@@ -520,6 +532,20 @@ def gemini_cmd(
                     console.print(
                         f"Chunk {chunk_num} processed: total={len(chunk)}, matched={chunk_matched}, missing={chunk_missing}, cumulative_ok={stats.get('rows_ok',0)}"
                     )
+                    if chunk_missing == 0:
+                        success_streak += 1
+                        if success_streak >= success_threshold and current_batch_size < max_batch_size:
+                            next_size = min(max_batch_size, int(math.ceil(current_batch_size * 1.2)))
+                            if next_size == current_batch_size and current_batch_size < max_batch_size:
+                                next_size = min(max_batch_size, current_batch_size + 1)
+                            if next_size != current_batch_size:
+                                console.print(
+                                    f"Success streak {success_streak} reached; increasing batch size to {next_size}"
+                                )
+                                current_batch_size = next_size
+                            success_streak = 0
+                    else:
+                        success_streak = 0
 
                     if accepted:
                         copy_rows_to_gemini(conn, accepted, output_table)
@@ -528,6 +554,7 @@ def gemini_cmd(
                     if stop:
                         break
                 except TimeoutError:
+                    success_streak = 0
                     if current_batch_size > 1:
                         current_batch_size = max(1, current_batch_size // 2)
                         console.print(f"Timeout encountered; reducing batch size to {current_batch_size}")
@@ -541,6 +568,24 @@ def gemini_cmd(
                         )
                         conn.commit()
                         console.print(f"Marked {len(ids_to_skip)} rows as gemini_skipped after repeated timeouts.")
+                        current_batch_size = 1
+                        continue
+                except ResponseParseError:
+                    success_streak = 0
+                    if current_batch_size > 1:
+                        current_batch_size = max(1, current_batch_size // 2)
+                        console.print(f"Invalid JSON response; reducing batch size to {current_batch_size}")
+                        continue
+                    else:
+                        ids_to_skip = [r["id"] for r in rows]
+                        conn.executemany(
+                            f"UPDATE {source_table} SET gemini_skipped=1 WHERE id=?",
+                            [(rid,) for rid in ids_to_skip],
+                        )
+                        conn.commit()
+                        console.print(
+                            f"Marked {len(ids_to_skip)} rows as gemini_skipped after repeated invalid JSON responses."
+                        )
                         current_batch_size = 1
                         continue
         finally:

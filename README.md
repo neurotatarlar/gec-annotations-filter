@@ -40,7 +40,7 @@ python -m app.cli toxicity --source-table dedup_segments --output-table toxicity
 4) **Gemini scoring (optional)**
 ```bash
 python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --model models/gemini-2.5-flash ; spd-say complete 
-python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --keys-path data/gemini_keys.yaml --model models/gemini-1.5-flash
+python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --keys-path data/gemini_keys.yaml --model models/gemini-25-flash
 # custom prompt: --prompt-path path/to/prompt.txt
 ```
 
@@ -73,7 +73,7 @@ Notes:
 - Remove system messages (`Post is not in text format.`, `Comment is not in text format.`).
 - Drop messages that are URL/phone/email-only.
 - Replace URLs/phones/emails with deterministic fakes.
-- Replace `[[Name]]` placeholders with deterministic Tatar names from `app/data/tatar_names.json`.
+- Replace `[[Name]]` placeholders with deterministic Tatar names from `data/tatar_names.json`.
 - Drop messages with single `[` `]` pairs (keeps `[[`/`]]` placeholders).
 
 Tables in `data.sqlite`:
