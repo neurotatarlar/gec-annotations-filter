@@ -42,6 +42,7 @@ python -m app.cli toxicity --source-table dedup_segments --output-table toxicity
 python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --model models/gemini-2.5-flash ; spd-say complete 
 python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --keys-path data/gemini_keys.yaml --model models/gemini-25-flash
 # custom prompt: --prompt-path path/to/prompt.txt
+# adaptive batch sizing: --batch-size 64 --max-batch-size 512
 ```
 
 5) **Export to Parquet**
@@ -62,7 +63,7 @@ Notes:
 - `ingest` skips rows already logged for the same dataset+output table (ingest_log) so re-runs only add new rows.
 - LLM scoring writes to `llm_segments` by default, whether via Gemini API or `llm-step`.
 - `prepare-import` is incremental: it records exported ids in `export_log` and only writes new eligible rows on rerun.
-- Gemini scoring adapts batch size on timeouts and marks `gemini_skipped` rows if a single item repeatedly times out.
+- Gemini scoring adapts batch size on timeouts/invalid JSON, can grow after consecutive successes, and marks `gemini_skipped` rows if a single item repeatedly fails.
 - Safe for incremental updates: `ingest`, `dedup`, `toxicity`, `gemini`, `prepare-import`. `export` always writes a full parquet snapshot.
 
 ## Notes on cleaning rules

@@ -353,6 +353,7 @@ def gemini_cmd(
     model: str,
     prompt_path: Optional[Path],
     batch_size: int,
+    max_batch_size: int,
     max_rows: Optional[int],
     report_path: Optional[Path],
 ):
@@ -393,7 +394,11 @@ def gemini_cmd(
     stop = False
     batch_size = max(1, batch_size)
     token_totals = Counter()
-    max_batch_size = max(1, batch_size)
+    max_batch_size = max(1, max_batch_size)
+    batch_size = max(1, batch_size)
+    if batch_size > max_batch_size:
+        console.print(f"batch_size ({batch_size}) exceeds max_batch_size ({max_batch_size}); clamping.")
+        batch_size = max_batch_size
     success_streak = 0
     success_threshold = 5
 
@@ -491,7 +496,7 @@ def gemini_cmd(
         LIMIT ?
         """
         chunk_num = 0
-        current_batch_size = max_batch_size
+        current_batch_size = batch_size
         try:
             while True:
                 if max_rows and processed >= max_rows:
@@ -556,7 +561,7 @@ def gemini_cmd(
                 except TimeoutError:
                     success_streak = 0
                     if current_batch_size > 1:
-                        current_batch_size = max(1, current_batch_size // 2)
+                        current_batch_size = max(1, int(math.floor(current_batch_size * 0.75)))
                         console.print(f"Timeout encountered; reducing batch size to {current_batch_size}")
                         continue
                     else:
@@ -573,7 +578,7 @@ def gemini_cmd(
                 except ResponseParseError:
                     success_streak = 0
                     if current_batch_size > 1:
-                        current_batch_size = max(1, current_batch_size // 2)
+                        current_batch_size = max(1, int(math.floor(current_batch_size * 0.75)))
                         console.print(f"Invalid JSON response; reducing batch size to {current_batch_size}")
                         continue
                     else:

@@ -68,10 +68,11 @@ def gemini_score(
     model: str = typer.Option(DEFAULT_CONFIG.gemini_model, help="Gemini model name."),
     prompt_path: Optional[Path] = typer.Option(None, help="Optional path to custom prompt; defaults to built-in."),
     batch_size: int = typer.Option(64, help="Rows to read from DB per loop and send per Gemini request."),
+    max_batch_size: int = typer.Option(512, help="Maximum batch size for adaptive Gemini requests."),
     max_rows: Optional[int] = typer.Option(None, help="Optional limit for debugging."),
     report_path: Optional[Path] = typer.Option(Path("reports/gemini_report.json"), help="Write JSON counters for Gemini stage."),
 ):
-    gemini_cmd(db_path, source_table, output_table, keys_path, model, prompt_path, batch_size, max_rows, report_path)
+    gemini_cmd(db_path, source_table, output_table, keys_path, model, prompt_path, batch_size, max_batch_size, max_rows, report_path)
 
 
 @app.command()
