@@ -392,10 +392,9 @@ def gemini_cmd(
     stats = Counter()
     processed = 0
     stop = False
-    batch_size = max(1, batch_size)
     token_totals = Counter()
-    max_batch_size = max(1, max_batch_size)
     batch_size = max(1, batch_size)
+    max_batch_size = max(1, max_batch_size)
     if batch_size > max_batch_size:
         console.print(f"batch_size ({batch_size}) exceeds max_batch_size ({max_batch_size}); clamping.")
         batch_size = max_batch_size

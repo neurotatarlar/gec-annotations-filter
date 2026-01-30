@@ -72,7 +72,18 @@ def gemini_score(
     max_rows: Optional[int] = typer.Option(None, help="Optional limit for debugging."),
     report_path: Optional[Path] = typer.Option(Path("reports/gemini_report.json"), help="Write JSON counters for Gemini stage."),
 ):
-    gemini_cmd(db_path, source_table, output_table, keys_path, model, prompt_path, batch_size, max_batch_size, max_rows, report_path)
+    gemini_cmd(
+        db_path,
+        source_table,
+        output_table,
+        keys_path,
+        model,
+        prompt_path,
+        batch_size,
+        max_batch_size,
+        max_rows,
+        report_path,
+    )
 
 
 @app.command()
