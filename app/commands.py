@@ -536,7 +536,8 @@ def gemini_cmd(
                     console.print(
                         f"Chunk {chunk_num} processed: total={len(chunk)}, matched={chunk_matched}, missing={chunk_missing}, cumulative_ok={stats.get('rows_ok',0)}"
                     )
-                    if chunk_missing == 0:
+                    missing_ratio = (chunk_missing / len(chunk)) if len(chunk) else 1.0
+                    if missing_ratio <= 0.05:
                         success_streak += 1
                         if success_streak >= success_threshold and current_batch_size < max_batch_size:
                             next_size = min(max_batch_size, int(math.ceil(current_batch_size * 1.2)))
