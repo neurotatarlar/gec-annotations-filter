@@ -36,11 +36,10 @@ python -m app.cli toxicity --source-table dedup_segments --output-table toxicity
 # To drop above a threshold: add --threshold 0.5
 ```
 
-5) **LLM scoring (Gemini API or manual copy/paste)**
-4) **Gemini scoring (optional)**
+4) **LLM scoring (Gemini API or manual copy/paste)**
 ```bash
-python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --model models/gemini-2.5-flash ; spd-say complete 
-python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --keys-path data/gemini_keys.yaml --model models/gemini-25-flash
+python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --model models/gemini-3-flash-preview ; spd-say complete
+python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --keys-path data/gemini_keys.yaml --model models/gemini-3-flash-preview
 # custom prompt: --prompt-path path/to/prompt.txt
 # adaptive batching: --batch-size 64 --max-batch-size 512
 ```
@@ -63,7 +62,7 @@ Notes:
 - `ingest` skips rows already logged for the same dataset+output table (ingest_log) so re-runs only add new rows.
 - LLM scoring writes to `llm_segments` by default, whether via Gemini API or `llm-step`.
 - `prepare-import` is incremental: it records exported ids in `export_log` and only writes new eligible rows on rerun.
-- Gemini scoring adapts batch size on timeouts/invalid JSON (grows after consecutive successes) and marks `gemini_skipped` rows if a single item repeatedly fails.
+- Gemini scoring adapts batch size on timeouts/invalid JSON (grows after consecutive successes; allows up to 5% missing items) and marks `gemini_skipped` only after repeated failures at batch size 1.
 - Safe for incremental updates: `ingest`, `dedup`, `toxicity`, `gemini`, `prepare-import`. `export` always writes a full parquet snapshot.
 
 ## Notes on cleaning rules
