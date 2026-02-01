@@ -1,3 +1,5 @@
+"""Configuration defaults for the text cleaning and scoring pipeline."""
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple

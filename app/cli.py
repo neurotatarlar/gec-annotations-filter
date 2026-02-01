@@ -1,3 +1,5 @@
+"""Typer CLI entry points for the pipeline stages."""
+
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +31,7 @@ def ingest(
     report_path: Optional[Path] = typer.Option(Path("reports/ingest_report.json"), help="Write JSON counters about filter reasons."),
     output_table: str = typer.Option("clean_segments", "--output-table", help="Destination table to write cleaned segments."),
 ):
+    """Stream dataset rows, clean them, and insert into the clean table."""
     ingest_cmd(db_path, dataset, split, cache_dir, text_field, url_field, limit, batch_size, report_path, output_table)
 
 
@@ -43,6 +46,7 @@ def dedup(
     batch_size: int = typer.Option(1000, help="Rows to process per batch."),
     report_path: Optional[Path] = typer.Option(Path("reports/dedup_report.json"), help="Write JSON counters for dedup stage."),
 ):
+    """Remove near-duplicate rows using SimHash."""
     dedup_cmd(db_path, source_table, output_table, distance, short_distance, short_token_threshold, batch_size, report_path)
 
 
@@ -56,6 +60,7 @@ def toxicity(
     device: int = typer.Option(-1, help="Transformers device id (-1 = CPU)."),
     report_path: Optional[Path] = typer.Option(Path("reports/toxicity_report.json"), help="Write JSON counters for toxicity stage."),
 ):
+    """Score toxicity for each row and store results."""
     toxicity_cmd(db_path, source_table, output_table, threshold, batch_size, device, report_path)
 
 
@@ -72,6 +77,7 @@ def gemini_score(
     max_rows: Optional[int] = typer.Option(None, help="Optional limit for debugging."),
     report_path: Optional[Path] = typer.Option(Path("reports/gemini_report.json"), help="Write JSON counters for Gemini stage."),
 ):
+    """Score rows with Gemini using adaptive batch sizing."""
     gemini_cmd(
         db_path,
         source_table,
@@ -95,6 +101,7 @@ def export_parquet(
         help="Table to export. Will fall back to dedup_segments if empty.",
     ),
 ):
+    """Export a table to a Parquet file."""
     export_parquet_cmd(db_path, output, table)
 
 
@@ -108,6 +115,7 @@ def prepare_import(
     dry_run: bool = typer.Option(False, help="If true, just report counts without writing or marking exported."),
     keep_proportions: bool = typer.Option(True, help="If true, preserve low/medium/high proportions even if total is smaller."),
 ):
+    """Build a JSON import batch for human annotation."""
     prepare_import_cmd(db_path, source_table, output, limit, extreme_share, dry_run, keep_proportions)
 
 

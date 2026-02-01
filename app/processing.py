@@ -1,3 +1,5 @@
+"""Text cleaning, filtering, and segmentation helpers for GEC prep."""
+
 import hashlib
 import json
 import re
@@ -43,6 +45,7 @@ class ProcessedSegment:
 
 
 def load_name_list(path: Path = DEFAULT_CONFIG.name_list_path) -> List[str]:
+    """Load placeholder names used for anonymization replacements."""
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -78,11 +81,13 @@ def is_contact_only(text: str) -> bool:
 
 
 def _fake_email(seed: str) -> str:
+    """Generate a deterministic fake email for a given seed."""
     h = deterministic_hash(seed)
     return f"mail{h % 100000:05d}@example.com"
 
 
 def _fake_phone(seed: str) -> str:
+    """Generate a deterministic fake phone number for a given seed."""
     h = deterministic_hash(seed)
     prefix = 900 + (h % 90)
     middle = (h // 100) % 1000
@@ -91,6 +96,7 @@ def _fake_phone(seed: str) -> str:
 
 
 def _fake_url(seed: str) -> str:
+    """Generate a deterministic fake URL for a given seed."""
     h = deterministic_hash(seed)
     return f"https://{h % 1_000_000:06d}.com"
 
@@ -121,10 +127,12 @@ def replace_fake_names(text: str, names: Sequence[str]) -> str:
 
 
 def tokenize_words(text: str) -> List[str]:
+    """Tokenize text into lowercase word-like units."""
     return WORD_RE.findall(text.lower())
 
 
 def split_sentences(text: str) -> List[str]:
+    """Split text into sentences using razdel when available."""
     if sentenize:
         return [s.text.strip() for s in sentenize(text)]
     # Fallback: split on sentence-ending punctuation.
@@ -188,16 +196,19 @@ def split_text(text: str, cfg: ProcessingConfig) -> List[str]:
 
 
 def count_tatar_letters(text: str, cfg: ProcessingConfig) -> int:
+    """Count Tatar-specific letters present in the text."""
     tatar_set = set(cfg.tatar_letters)
     return sum(1 for ch in text if ch in tatar_set)
 
 
 def passes_filters(text: str, cfg: ProcessingConfig) -> bool:
+    """Check whether text passes all cleaning filters."""
     ok, _ = _passes_filters_with_reason(text, cfg)
     return ok
 
 
 def _passes_filters_with_reason(text: str, cfg: ProcessingConfig) -> tuple[bool, str]:
+    """Return filter result plus a reason code for rejections."""
     letters = LETTER_RE.findall(text)
     if cfg.cyrillic_only and LATIN_LETTER_RE.search(text):
         return False, "latin_present"
@@ -231,6 +242,7 @@ def _passes_filters_with_reason(text: str, cfg: ProcessingConfig) -> tuple[bool,
 
 
 def digest_from_url(url: str) -> str:
+    """Compute a stable digest from a source URL."""
     return hashlib.sha1(url.encode("utf-8")).hexdigest()
 
 

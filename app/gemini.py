@@ -1,3 +1,5 @@
+"""Gemini prompt templates, schema validation, and request helpers."""
+
 import json
 import random
 import time
@@ -208,6 +210,7 @@ INPUT:
 
 
 def load_keys(path: Path) -> List[str]:
+    """Load Gemini API keys from a YAML list or mapping."""
     if not path.exists():
         raise FileNotFoundError(f"No Gemini keys file at {path}")
     data = yaml.safe_load(path.read_text())
@@ -251,6 +254,8 @@ ALLOWED_ERROR_TYPE = {
 
 
 class LabelPayload(BaseModel):
+    """Validated label payload returned by the scoring model."""
+
     main_language: str
     tatar_prob: float
     russian_share: float
@@ -264,11 +269,14 @@ class LabelPayload(BaseModel):
 
 
 class ScoredItem(BaseModel):
+    """Single scored item with id and labels."""
+
     id: str
     labels: LabelPayload
 
 
 def _coerce_float(val: Any, field: str) -> float:
+    """Coerce a value to float with a helpful error message."""
     try:
         return float(val)
     except Exception as e:
@@ -276,6 +284,7 @@ def _coerce_float(val: Any, field: str) -> float:
 
 
 def _validate_labels(ldict: Dict[str, Any]) -> LabelPayload:
+    """Validate label fields and normalize enums."""
     if not isinstance(ldict, dict):
         raise ValueError("labels must be an object")
     ml = str(ldict.get("main_language", "")).lower()
@@ -302,6 +311,7 @@ def _validate_labels(ldict: Dict[str, Any]) -> LabelPayload:
 
 
 def _validate_items(data: Any) -> List[Dict[str, Any]]:
+    """Validate a list response and return normalized label dicts."""
     if not isinstance(data, list):
         raise ValueError("Response must be a JSON list")
     validated: List[Dict[str, Any]] = []
@@ -345,10 +355,7 @@ def call_gemini(
 
 
 def parse_json_response(resp_text: str) -> Dict:
-    """
-    Strictly parse Gemini response as JSON list of objects with 'id' and 'labels'.
-    Raises ValueError if format is unexpected.
-    """
+    """Parse and validate a Gemini JSON response, raising on mismatch."""
     text = resp_text.strip()
     if not text:
         raise ValueError("Empty response")
@@ -382,9 +389,7 @@ def parse_json_response(resp_text: str) -> Dict:
 
 
 def build_batch_prompt(base_prompt: str, rows: Sequence[Dict[str, str]]) -> str:
-    """
-    Extend the base prompt to include the expected JSON input payload.
-    """
+    """Extend the base prompt with an input payload for batch scoring."""
     payload = {
         "task": "tatar_gec_scoring",
         "items": [

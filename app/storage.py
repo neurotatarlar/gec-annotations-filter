@@ -1,3 +1,5 @@
+"""SQLite helpers for pipeline tables and data movement."""
+
 import sqlite3
 import re
 from contextlib import contextmanager
@@ -11,6 +13,7 @@ from .processing import ProcessedSegment
 
 
 def connect(db_path: Path | str) -> sqlite3.Connection:
+    """Open a SQLite connection with WAL mode enabled."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -20,6 +23,7 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
 
 @contextmanager
 def open_db(db_path: Path | str) -> Generator[sqlite3.Connection, None, None]:
+    """Context manager that yields a connection and commits on exit."""
     conn = connect(db_path)
     try:
         yield conn
@@ -29,12 +33,14 @@ def open_db(db_path: Path | str) -> Generator[sqlite3.Connection, None, None]:
 
 
 def _validate_table_name(name: str) -> str:
+    """Ensure table names are safe for string interpolation."""
     if not name or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
         raise ValueError(f"Unsafe table name: {name}")
     return name
 
 
 def ensure_clean_table(conn: sqlite3.Connection, table: str = "clean_segments") -> None:
+    """Create the clean_segments table if missing."""
     table = _validate_table_name(table)
     conn.execute(
         f"""
@@ -50,6 +56,7 @@ def ensure_clean_table(conn: sqlite3.Connection, table: str = "clean_segments") 
 
 
 def ensure_dedup_table(conn: sqlite3.Connection, table: str = "dedup_segments") -> None:
+    """Create the dedup_segments table if missing."""
     table = _validate_table_name(table)
     conn.execute(
         f"""
@@ -65,6 +72,7 @@ def ensure_dedup_table(conn: sqlite3.Connection, table: str = "dedup_segments") 
 
 
 def ensure_toxicity_table(conn: sqlite3.Connection, table: str = "toxicity_segments") -> None:
+    """Create the toxicity_segments table if missing (adds gemini_skipped if needed)."""
     table = _validate_table_name(table)
     conn.execute(
         f"""
@@ -87,6 +95,7 @@ def ensure_toxicity_table(conn: sqlite3.Connection, table: str = "toxicity_segme
 
 
 def ensure_gemini_table(conn: sqlite3.Connection, table: str = "gemini_segments") -> None:
+    """Create the gemini/llm table if missing."""
     table = _validate_table_name(table)
     conn.execute(
         f"""
@@ -123,6 +132,7 @@ def ensure_export_log_table(conn: sqlite3.Connection) -> None:
 
 
 def insert_clean_segments(conn: sqlite3.Connection, segments: Sequence[ProcessedSegment], table: str = "clean_segments") -> int:
+    """Insert cleaned segments into the destination table."""
     ensure_clean_table(conn, table)
     rows = [
         (
@@ -139,6 +149,7 @@ def insert_clean_segments(conn: sqlite3.Connection, segments: Sequence[Processed
 
 
 def copy_rows_to_dedup(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row], table: str = "dedup_segments") -> int:
+    """Copy rows into the dedup table."""
     ensure_dedup_table(conn, table)
     payload = [(r["id"], r["parent_digest"], r["text"], r["norm_hash"]) for r in rows]
     sql = f"INSERT OR IGNORE INTO {_validate_table_name(table)} (id, parent_digest, text, norm_hash) VALUES (?, ?, ?, ?)"
@@ -147,6 +158,7 @@ def copy_rows_to_dedup(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row], ta
 
 
 def copy_rows_to_toxicity(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row], table: str = "toxicity_segments") -> int:
+    """Copy rows into the toxicity table."""
     ensure_toxicity_table(conn, table)
     def _val(row, key):
         try:
@@ -170,6 +182,7 @@ def copy_rows_to_toxicity(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row],
 
 
 def copy_rows_to_gemini(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row], table: str) -> int:
+    """Copy rows into the gemini/llm table."""
     ensure_gemini_table(conn, table)
     payload = [
         (
@@ -198,9 +211,7 @@ def ensure_llm_table(conn: sqlite3.Connection, table: str = "llm_segments") -> N
 def iterate_table(
     conn: sqlite3.Connection, table: str, batch_size: int = 1000
 ) -> Generator[List[sqlite3.Row], None, None]:
-    """
-    Stream rows from a table by rowid with forward-only pagination.
-    """
+    """Stream rows from a table by rowid with forward-only pagination."""
     table = _validate_table_name(table)
     last_rowid = 0
     while True:
@@ -215,9 +226,7 @@ def iterate_table(
 
 
 def collect_ids(conn: sqlite3.Connection, table: str) -> Set[str]:
-    """
-    Collect ids from a table into a set (used for incremental stages).
-    """
+    """Collect ids from a table into a set (used for incremental stages)."""
     table = _validate_table_name(table)
     ids: Set[str] = set()
     for rows in iterate_table(conn, table, batch_size=1000):
@@ -226,11 +235,13 @@ def collect_ids(conn: sqlite3.Connection, table: str) -> Set[str]:
 
 
 def text_hash(text: str) -> str:
+    """Compute a normalized content hash for exact deduplication."""
     normalized = normalize_for_hash(text)
     return xxhash.xxh64(normalized).hexdigest()
 
 
 def ensure_ingest_log_table(conn: sqlite3.Connection) -> None:
+    """Create ingest_log for tracking processed dataset rows."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS ingest_log (

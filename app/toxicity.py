@@ -1,3 +1,5 @@
+"""Toxicity scoring helpers using a multilingual classifier."""
+
 from typing import Iterable, List, Sequence, Tuple
 
 from transformers import pipeline
@@ -51,5 +53,6 @@ def extract_label_score(result) -> Tuple[int, float]:
 
 
 def predict_toxicity(classifier, texts: Sequence[str]) -> List[Tuple[int, float]]:
+    """Run the classifier over texts and return (label, score) pairs."""
     outputs = classifier(list(texts), truncation=True)
     return [extract_label_score(out) for out in outputs]

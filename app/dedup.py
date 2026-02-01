@@ -1,3 +1,5 @@
+"""Near-duplicate detection helpers using SimHash."""
+
 import regex as reg
 from simhash import Simhash, SimhashIndex
 from typing import Generator, Iterable, Set
@@ -6,11 +8,13 @@ from .processing import tokenize_words
 
 
 def normalize_for_hash(text: str) -> str:
+    """Normalize text to stabilize hashing for deduplication."""
     normalized = reg.sub(r"\s+", " ", text.strip().lower())
     return normalized
 
 
 def simhash_from_text(text: str) -> Simhash:
+    """Compute a 64-bit SimHash over tokenized text."""
     return Simhash(tokenize_words(text), f=64)
 
 

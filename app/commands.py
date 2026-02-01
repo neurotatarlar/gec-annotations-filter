@@ -1,3 +1,5 @@
+"""Pipeline command implementations for ingest, dedup, scoring, and export."""
+
 import json
 import math
 import hashlib
@@ -67,10 +69,12 @@ from .toxicity import load_toxicity_pipeline, predict_toxicity
 
 # Utility helpers
 def ensure_parent(path: Path) -> None:
+    """Ensure the parent directory for a path exists."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def resolve_field(row: dict, field: str, fallback: str, idx: int) -> str:
+    """Pick a stable row identifier from known fields or a fallback."""
     for key in (field, fallback, "message_url", "permalink", "id"):
         value = row.get(key)
         if value:
@@ -79,14 +83,17 @@ def resolve_field(row: dict, field: str, fallback: str, idx: int) -> str:
 
 
 def _safe_token(value: str) -> str:
+    """Sanitize strings for use in filenames."""
     return "".join(ch if ch.isalnum() else "_" for ch in value)
 
 
 def _revision_file(cache_dir: Path, dataset: str, split: str) -> Path:
+    """Return the path to the revision marker file for a dataset/split."""
     return cache_dir / "revisions" / f"{_safe_token(dataset)}__{_safe_token(split)}.txt"
 
 
 def _fetch_remote_revision(dataset: str) -> Optional[str]:
+    """Fetch the remote revision hash for an HF dataset when available."""
     if Path(dataset).exists():
         return None
     try:
@@ -101,6 +108,12 @@ def _fetch_remote_revision(dataset: str) -> Optional[str]:
 
 
 def prepare_dataset_cache(dataset: str, split: str, cache_dir: Path) -> tuple[datasets.DownloadMode, str]:
+    """
+    Warm the HF dataset cache and record the revision.
+
+    Returns the download mode used and a revision tag (remote hash, cached hash,
+    or "local" if the dataset is a local path).
+    """
     ensure_parent(cache_dir)
     rev_path = _revision_file(cache_dir, dataset, split)
     cached_rev = rev_path.read_text(encoding="utf-8").strip() if rev_path.exists() else None
@@ -134,6 +147,7 @@ def prepare_dataset_cache(dataset: str, split: str, cache_dir: Path) -> tuple[da
 
 
 def row_hash(source_id: str, raw_text: str) -> str:
+    """Compute a stable SHA1 over the source id and raw text."""
     payload = (source_id or "") + "\n" + raw_text
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
@@ -151,6 +165,12 @@ def ingest_cmd(
     report_path: Optional[Path],
     output_table: str,
 ):
+    """
+    Stream a dataset, clean and segment text, and insert into the clean table.
+
+    Uses an ingest_log to skip previously processed rows for the same dataset
+    and output table, and optionally emits a JSON report.
+    """
     from collections import Counter
 
     cfg = DEFAULT_CONFIG
@@ -229,6 +249,7 @@ def dedup_cmd(
     batch_size: int,
     report_path: Optional[Path],
 ):
+    """Deduplicate rows using SimHash with stricter handling for short texts."""
     total = 0
     kept = 0
     from collections import Counter
@@ -306,6 +327,7 @@ def toxicity_cmd(
     device: int,
     report_path: Optional[Path],
 ):
+    """Score toxicity for rows and optionally drop those above a threshold."""
     from collections import Counter
 
     classifier = load_toxicity_pipeline(device=device)
@@ -357,6 +379,11 @@ def gemini_cmd(
     max_rows: Optional[int],
     report_path: Optional[Path],
 ):
+    """
+    Score rows with Gemini and store JSON labels in the output table.
+
+    Handles key rotation, adaptive batch sizing, retries, and incremental writes.
+    """
     from collections import Counter
     from rich.console import Console
     
@@ -626,6 +653,7 @@ def export_parquet_cmd(
     output: Path,
     table: str,
 ):
+    """Export a table to a Parquet file (fallback to dedup if empty)."""
     ensure_parent(db_path)
     with open_db(db_path) as conn:
         count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -644,6 +672,7 @@ def export_parquet_cmd(
 def _stream_table_to_parquet(
     conn: sqlite3.Connection, table: str, output: Path, batch_size: int = 2000
 ) -> int:
+    """Stream table rows to Parquet in batches."""
     schema = pa.schema([("id", pa.string()), ("text", pa.string())])
     written = 0
     with pq.ParquetWriter(output, schema) as writer:
