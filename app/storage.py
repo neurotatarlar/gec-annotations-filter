@@ -4,7 +4,7 @@ import sqlite3
 import re
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator, Iterable, List, Sequence, Set
+from typing import Generator, List, Sequence, Set
 
 import xxhash
 

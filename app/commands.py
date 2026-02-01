@@ -4,14 +4,11 @@ import json
 import math
 import hashlib
 import random
-import re
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 import sqlite3
 from pydantic import TypeAdapter
-import time
 
 import datasets
 import polars as pl
@@ -31,7 +28,6 @@ from rich.progress import track
 
 from .config import DEFAULT_CONFIG
 from .dedup import simhash_from_text
-from pydantic import TypeAdapter
 
 from .gemini import (
     DEFAULT_PROMPT,

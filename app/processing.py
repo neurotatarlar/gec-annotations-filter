@@ -2,11 +2,10 @@
 
 import hashlib
 import json
-import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import List, Sequence
 
 import regex as reg
 import xxhash

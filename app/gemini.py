@@ -1,9 +1,7 @@
 """Gemini prompt templates, schema validation, and request helpers."""
 
 import json
-import random
-import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Any
 
