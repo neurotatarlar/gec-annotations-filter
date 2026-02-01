@@ -9,7 +9,6 @@ from typing import Dict, List, Optional, Sequence, Any
 
 from pydantic import BaseModel, TypeAdapter
 
-import google.generativeai as genai
 from google.genai import types
 import yaml
 
