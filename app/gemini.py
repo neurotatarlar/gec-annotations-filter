@@ -5,7 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Any
 
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel
 
 from google.genai import types
 import yaml
