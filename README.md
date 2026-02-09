@@ -36,9 +36,8 @@ python -m app.cli toxicity --source-table dedup_segments --output-table toxicity
 # To drop above a threshold: add --threshold 0.5
 ```
 
-4) **LLM scoring (Gemini API or manual copy/paste)**
+4) **LLM scoring (Gemini API)**
 ```bash
-python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --model models/gemini-3-flash-preview ; spd-say complete
 python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --keys-path data/gemini_keys.yaml --model models/gemini-3-flash-preview
 # custom prompt: --prompt-path path/to/prompt.txt
 # adaptive batching: --batch-size 64 --max-batch-size 512
@@ -46,29 +45,29 @@ python -m app.cli gemini --source-table toxicity_segments --output-table llm_seg
 
 5) **Export to Parquet**
 ```bash
-python -m app.cli export output.parquet
+python -m app.cli export-parquet output.parquet
 ```
 
 6) **Prepare annotation batch (JSON)**
 ```bash
-python -m app.cli prepare-import --source-table llm_segments --limit 5000 data/import.json
+python -m app.cli prepare-import --source-table llm_segments --limit 5000 --output data/import.json
 # Use --dry-run to see counts without writing.
-# Use --keep-proportions to preserve low/medium/high error_density ratios.
+# Proportions are preserved by default; add --no-keep-proportions to allow freer filling.
 # Use --extreme-share to control low/high share (default 0.15 each).
 ```
 
 Notes:
 - Use `--source-table`/`--output-table` to chain stages without mutating inputs; tables must differ.
 - `ingest` skips rows already logged for the same dataset+output table (ingest_log) so re-runs only add new rows.
-- LLM scoring writes to `llm_segments` by default, whether via Gemini API or `llm-step`.
+- LLM scoring writes to `llm_segments` by default.
 - `prepare-import` is incremental: it records exported ids in `export_log` and only writes new eligible rows on rerun.
 - Gemini scoring adapts batch size on timeouts/invalid JSON (grows after consecutive successes; allows up to 5% missing items) and marks `gemini_skipped` only after repeated failures at batch size 1.
 - Safe for incremental updates: `ingest`, `dedup`, `toxicity`, `gemini`, `prepare-import`. `export` always writes a full parquet snapshot.
 
 ## Notes on cleaning rules
 
-- Cyrillic-only letters; keep emojis.
-- Word count 5–50; char count 20–300; at least 10 letters and 5 Tatar-specific letters (`ӘәҮүҖҗҢңӨөҺһ`).
+- Does not enforce Cyrillic-only by default (`cyrillic_only=False`); emojis are kept.
+- Word count 6–50; char count 30–500; at least 10 letters and 6 Tatar-specific letters (`ӘәҮүҖҗҢңӨөҺһ`).
 - Split long texts by sentences into compliant chunks.
 - Remove system messages (`Post is not in text format.`, `Comment is not in text format.`).
 - Drop messages that are URL/phone/email-only.
@@ -76,7 +75,7 @@ Notes:
 - Replace `[[Name]]` placeholders with deterministic Tatar names from `data/tatar_names.json`.
 - Drop messages with single `[` `]` pairs (keeps `[[`/`]]` placeholders).
 
-Tables in `data.sqlite`:
+Tables in `data/pipeline.sqlite`:
 - `clean_segments`: cleaned + split texts with exact deduplication.
 - `dedup_segments`: after near-duplicate filtering.
 - `toxicity_segments`: after toxicity scoring (stores label + score; optional dropping if threshold set).
