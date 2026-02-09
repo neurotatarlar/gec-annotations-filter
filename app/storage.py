@@ -161,6 +161,7 @@ def copy_rows_to_toxicity(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row],
     """Copy rows into the toxicity table."""
     ensure_toxicity_table(conn, table)
     def _val(row, key):
+        """Support both sqlite3.Row and mapping-style rows."""
         try:
             return row[key]
         except Exception:

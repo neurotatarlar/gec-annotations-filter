@@ -393,6 +393,7 @@ def gemini_cmd(
     expired_path = keys_path.with_suffix(keys_path.suffix + ".expired")
 
     def _load_expired() -> set[str]:
+        """Load keys already marked exhausted on previous runs."""
         if not expired_path.exists():
             return set()
         try:
@@ -404,6 +405,7 @@ def gemini_cmd(
                 return set()
 
     def _save_expired(expired: set[str]) -> None:
+        """Persist exhausted keys so retries skip them."""
         expired_path.write_text(json.dumps(sorted(expired), ensure_ascii=False, indent=2), encoding="utf-8")
 
     expired_keys = _load_expired()
@@ -425,9 +427,11 @@ def gemini_cmd(
     success_threshold = 5
 
     class ResponseParseError(RuntimeError):
+        """Raised when Gemini returns invalid JSON for the expected schema."""
         pass
 
     def _usage_val(usage, key: str) -> int:
+        """Read an integer usage field from dict- or object-like metadata."""
         if usage is None:
             return 0
         if isinstance(usage, dict):
@@ -441,6 +445,7 @@ def gemini_cmd(
             return 0
 
     def _record_usage(usage) -> None:
+        """Accumulate and print per-request token usage counters."""
         prompt_tokens = _usage_val(usage, "prompt_token_count")
         output_tokens = _usage_val(usage, "candidates_token_count")
         total_tokens = _usage_val(usage, "total_token_count")
@@ -454,6 +459,12 @@ def gemini_cmd(
         )
 
     def score_chunk(chunk: List[Dict]) -> Tuple[Dict[str, Dict], Optional[str]]:
+        """
+        Score one chunk with retry logic across available keys.
+
+        Retries transient service errors, marks quota-exhausted keys as expired,
+        and raises on parse/timeouts so callers can shrink batch size.
+        """
         last_error: Optional[str] = None
         tries = 0
         nonlocal keys, rotator, expired_keys

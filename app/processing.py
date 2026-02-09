@@ -118,6 +118,7 @@ def replace_fake_names(text: str, names: Sequence[str]) -> str:
         return FAKE_NAME_RE.sub("", text)
 
     def _replacer(match: reg.Match) -> str:
+        """Map a placeholder token to a deterministic name."""
         raw = match.group(1).strip()
         idx = deterministic_hash(raw) % len(names)
         return names[idx]
@@ -170,6 +171,7 @@ def split_text(text: str, cfg: ProcessingConfig) -> List[str]:
     current: List[str] = []
 
     def _flush_current():
+        """Append the current sentence buffer as one segment."""
         if current:
             segments.append(" ".join(current).strip())
 
@@ -256,6 +258,7 @@ def process_text(
     Clean a raw message and return zero or more valid segments.
     """
     def bump(key: str) -> None:
+        """Increment a stats counter when tracking is enabled."""
         if stats is not None:
             stats[key] += 1
 

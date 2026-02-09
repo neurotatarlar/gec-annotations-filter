@@ -229,10 +229,12 @@ class KeyRotator:
     """Round-robin over API keys with simple backoff."""
 
     def __init__(self, keys: List[str]):
+        """Store keys and reset rotation state."""
         self.keys = keys
         self.idx = 0
 
     def next_key(self) -> str:
+        """Return the next key and advance the rotation index."""
         key = self.keys[self.idx % len(self.keys)]
         self.idx = (self.idx + 1) % len(self.keys)
         return key
