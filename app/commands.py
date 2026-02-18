@@ -6,7 +6,7 @@ import hashlib
 import random
 import time
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 import sqlite3
 from pydantic import TypeAdapter
 
@@ -31,9 +31,8 @@ from .dedup import simhash_from_text
 
 from .gemini import (
     DEFAULT_PROMPT,
-    KeyRotator,
     call_gemini,
-    load_keys,
+    load_account_keys,
     build_batch_prompt,
     ScoredItem,
     LabelPayload,
@@ -372,17 +371,23 @@ def gemini_cmd(
     prompt_path: Optional[Path],
     batch_size: int,
     max_batch_size: int,
+    workers: int,
+    account_cooldown_seconds: int,
     max_rows: Optional[int],
     report_path: Optional[Path],
 ):
     """
     Score rows with Gemini and store JSON labels in the output table.
 
-    Handles key rotation, adaptive batch sizing, retries, and incremental writes.
+    Handles account-aware parallel requests, adaptive batch sizing, retries,
+    and incremental writes.
     """
     from collections import Counter
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
     from rich.console import Console
-    
+
     console = Console()
 
     ensure_parent(db_path)
@@ -408,23 +413,15 @@ def gemini_cmd(
         """Persist exhausted keys so retries skip them."""
         expired_path.write_text(json.dumps(sorted(expired), ensure_ascii=False, indent=2), encoding="utf-8")
 
-    expired_keys = _load_expired()
-    keys = [k for k in load_keys(keys_path) if k not in expired_keys]
-    if not keys:
-        console.print("No usable Gemini keys after filtering expired keys.")
-        raise typer.Exit(code=1)
-    rotator = KeyRotator(keys)
-    stats = Counter()
-    processed = 0
-    stop = False
-    token_totals = Counter()
-    batch_size = max(1, batch_size)
-    max_batch_size = max(1, max_batch_size)
-    if batch_size > max_batch_size:
-        console.print(f"batch_size ({batch_size}) exceeds max_batch_size ({max_batch_size}); clamping.")
-        batch_size = max_batch_size
-    success_streak = 0
-    success_threshold = 5
+    def _log(message: str, style: Optional[str] = None, account: Optional[str] = None) -> None:
+        """Print a log line with thread/account context."""
+        thread_name = threading.current_thread().name
+        context = thread_name if account is None else f"{thread_name}|{account}"
+        text = f"{context}: {message}"
+        if style:
+            console.print(text, style=style)
+        else:
+            console.print(text)
 
     class ResponseParseError(RuntimeError):
         """Raised when Gemini returns invalid JSON for the expected schema."""
@@ -444,82 +441,167 @@ def gemini_cmd(
         except Exception:
             return 0
 
-    def _record_usage(usage) -> None:
-        """Accumulate and print per-request token usage counters."""
+    def _usage_from_meta(usage) -> tuple[int, int, int]:
+        """Extract usage counters from Gemini metadata."""
         prompt_tokens = _usage_val(usage, "prompt_token_count")
         output_tokens = _usage_val(usage, "candidates_token_count")
         total_tokens = _usage_val(usage, "total_token_count")
+        return prompt_tokens, output_tokens, total_tokens
+
+    def _record_usage(prompt_tokens: int, output_tokens: int, total_tokens: int) -> None:
+        """Accumulate and print per-request token usage counters."""
         token_totals["input"] += prompt_tokens
         token_totals["output"] += output_tokens
         token_totals["total"] += total_tokens
         token_totals["requests"] += 1
-        console.print(
+        _log(
             f"Gemini tokens: input={prompt_tokens}, output={output_tokens}, total={total_tokens}",
             style='green',
         )
 
-    def score_chunk(chunk: List[Dict]) -> Tuple[Dict[str, Dict], Optional[str]]:
-        """
-        Score one chunk with retry logic across available keys.
+    def _next_account_key(account: Dict[str, Any]) -> str:
+        """Rotate keys within one account."""
+        key = account["keys"][account["idx"] % len(account["keys"])]
+        account["idx"] = (account["idx"] + 1) % len(account["keys"])
+        return key
 
-        Retries transient service errors, marks quota-exhausted keys as expired,
-        and raises on parse/timeouts so callers can shrink batch size.
+    def score_chunk(
+        account: Dict[str, Any],
+        chunk: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Score one chunk with retry logic within a single account.
+
+        Returns a structured result so the caller can update counters and decide
+        whether to shrink batch size or disable exhausted accounts.
         """
         last_error: Optional[str] = None
+        exhausted_in_call: List[str] = []
         tries = 0
-        nonlocal keys, rotator, expired_keys
-        while keys and tries < len(keys) + 1:
+        while account["keys"] and tries < len(account["keys"]) + 1:
             tries += 1
-            key = rotator.next_key()
+            key = _next_account_key(account)
             try:
                 client = genai.Client(api_key=key)
                 prompt_text = build_batch_prompt(prompt, [{"id": r["id"], "text": r["text"]} for r in chunk])
-                # console.print(prompt_text, style="honeydew2")
                 resp_text, usage = call_gemini(client, model, prompt_text, schema=list[ScoredItem])
-                # console.print(resp_text, style="thistle1")
-                _record_usage(usage)
+                prompt_tokens, output_tokens, total_tokens = _usage_from_meta(usage)
                 ta = TypeAdapter(List[ScoredItem])
                 try:
-                    res = ta.validate_python(json.loads(resp_text))
+                    items = ta.validate_python(json.loads(resp_text))
                 except Exception as exc:
                     raise ResponseParseError(str(exc)) from exc
                 time.sleep(5)
-                return res
-            except ResponseParseError:
-                raise
+                return {
+                    "status": "ok",
+                    "items": items,
+                    "error": None,
+                    "usage": (prompt_tokens, output_tokens, total_tokens),
+                    "exhausted_keys": exhausted_in_call,
+                }
+            except ResponseParseError as exc:
+                return {
+                    "status": "parse_error",
+                    "items": [],
+                    "error": str(exc),
+                    "usage": (0, 0, 0),
+                    "exhausted_keys": exhausted_in_call,
+                }
             except Exception as exc:  # pragma: no cover - network errors
                 import traceback
+
                 last_error = str(exc)
                 if "UNAVAILABLE" in last_error or "overloaded" in last_error.lower():
-                    console.print("Gemini overloaded (503). Sleeping 60s before retry...")
+                    _log("Gemini overloaded (503). Sleeping 60s before retry...", account=account["name"])
                     time.sleep(60)
                     continue
                 if "DEADLINE_EXCEEDED" in last_error or "timed out" in last_error.lower():
-                    console.print(f"Gemini timed out (504) on chunk size {len(chunk)}; will reduce batch size.")
-                    raise TimeoutError(last_error)
+                    return {
+                        "status": "timeout",
+                        "items": [],
+                        "error": last_error,
+                        "usage": (0, 0, 0),
+                        "exhausted_keys": exhausted_in_call,
+                    }
                 if "RESOURCE_EXHAUSTED" in last_error or "quota" in last_error.lower():
-                    console.print(f"Key appears exhausted; marking as expired: {key}")
-                    traceback.print_exc()
-                    expired_keys.add(key)
-                    _save_expired(expired_keys)
-                    keys = [k for k in keys if k != key]
-                    if not keys:
-                        console.print("All Gemini keys exhausted.")
-                        raise typer.Exit(code=1)
-                    rotator = KeyRotator(keys)
-                    time.sleep(5)
+                    _log("Key appears exhausted; marking as expired.", account=account["name"])
+                    exhausted_in_call.append(key)
+                    account["keys"] = [k for k in account["keys"] if k != key]
+                    if account["keys"]:
+                        account["idx"] = account["idx"] % len(account["keys"])
+                        if account_cooldown_seconds > 0:
+                            _log(
+                                f"Cooling down account for {account_cooldown_seconds}s before trying next key.",
+                                account=account["name"],
+                            )
+                            time.sleep(account_cooldown_seconds)
                     continue
                 traceback.print_exc()
                 time.sleep(5)
                 continue
-        if last_error and ("DEADLINE_EXCEEDED" in last_error or "timed out" in last_error.lower()):
-            raise TimeoutError(last_error)
-        return {}, last_error
+        if not account["keys"]:
+            return {
+                "status": "account_exhausted",
+                "items": [],
+                "error": "Account has no usable keys left",
+                "usage": (0, 0, 0),
+                "exhausted_keys": exhausted_in_call,
+            }
+        return {
+            "status": "error",
+            "items": [],
+            "error": last_error,
+            "usage": (0, 0, 0),
+            "exhausted_keys": exhausted_in_call,
+        }
+
+    expired_keys = _load_expired()
+    raw_accounts = load_account_keys(keys_path)
+    account_pool: List[Dict[str, Any]] = []
+    for account_name, account_keys in raw_accounts.items():
+        usable_keys = [k for k in account_keys if k not in expired_keys]
+        if usable_keys:
+            account_pool.append({"name": account_name, "keys": usable_keys, "idx": 0})
+    if not account_pool:
+        _log("No usable Gemini accounts after filtering expired keys.")
+        raise typer.Exit(code=1)
+
+    workers = max(1, workers)
+    account_cooldown_seconds = max(0, account_cooldown_seconds)
+    if workers > len(account_pool):
+        _log(
+            f"workers ({workers}) exceeds available accounts ({len(account_pool)}); clamping."
+        )
+    workers = min(workers, len(account_pool))
+
+    stats = Counter()
+    processed = 0
+    token_totals = Counter()
+    batch_size = max(1, batch_size)
+    max_batch_size = max(1, max_batch_size)
+    if batch_size > max_batch_size:
+        _log(f"batch_size ({batch_size}) exceeds max_batch_size ({max_batch_size}); clamping.")
+        batch_size = max_batch_size
+    success_streak = 0
+    success_threshold = 5
+    accounts = deque(account_pool)
+    all_accounts_exhausted = False
 
     with open_db(db_path) as conn:
         if source_table == "toxicity_segments":
             ensure_toxicity_table(conn, source_table)
         ensure_llm_table(conn, output_table)
+        pending_count_sql = f"""
+        SELECT COUNT(*)
+        FROM {source_table} AS s
+        LEFT JOIN {output_table} AS o ON s.id = o.id
+        WHERE o.id IS NULL AND COALESCE(s.toxicity_label, 0) != 1 AND COALESCE(s.gemini_skipped,0)=0
+        """
+        total_count_sql = f"""
+        SELECT COUNT(*)
+        FROM {source_table} AS s
+        WHERE COALESCE(s.toxicity_label, 0) != 1 AND COALESCE(s.gemini_skipped,0)=0
+        """
         pending_sql = f"""
         SELECT s.*
         FROM {source_table} AS s
@@ -528,131 +610,188 @@ def gemini_cmd(
         ORDER BY s.rowid
         LIMIT ?
         """
-        chunk_num = 0
+        total_rows = int(conn.execute(total_count_sql).fetchone()[0] or 0)
+        remaining_rows = int(conn.execute(pending_count_sql).fetchone()[0] or 0)
+        already_processed_rows = total_rows - remaining_rows
+        stats["rows_total"] = total_rows
+        stats["rows_remaining"] = remaining_rows
+        stats["rows_already_processed"] = already_processed_rows
+        _log(
+            "Gemini rows: "
+            f"total={total_rows}, already_processed={already_processed_rows}, remaining={remaining_rows}, "
+            f"workers={workers}, accounts={len(account_pool)}, account_cooldown_seconds={account_cooldown_seconds}"
+        )
         current_batch_size = batch_size
-        try:
-            while True:
-                if max_rows and processed >= max_rows:
-                    console.print("Reached max_rows limit.")
-                    break
-
-                rows = conn.execute(pending_sql, (current_batch_size,)).fetchall()
-                if not rows:
-                    console.print("No more rows to process.")
-                    break
-
-                chunk = [dict(r) for r in rows]
-                console.print(
-                    f"Sending chunk {chunk_num + 1} with batch_size={len(chunk)} (current limit={current_batch_size})"
-                )
-                try:
-                    chunk_num += 1
-                    accepted: List[Dict] = []
-                    scored_items = {s.id: s.labels for s in score_chunk(chunk) if hasattr(s, "id") and hasattr(s, "labels")}
-
-                    processed += len(chunk)
-                    stats["rows_total"] += len(chunk)
-
-                    for row in chunk:
-                        payload = scored_items.get(str(row["id"]))
-                        if not payload:
-                            continue
-                        row_data = dict(row)
-                        row_data["gemini_json"]=payload.model_dump_json(indent=None, by_alias=True, exclude_none=True, exclude_unset=True, ensure_ascii=False)
-                        if payload:
-                            stats["rows_ok"] += 1
-                        else:
-                            stats["errors"] += 1
-                        accepted.append(row_data)
-
-                    chunk_matched = len(accepted)
-                    chunk_missing = len(chunk) - chunk_matched
-                    console.print(
-                        f"Chunk {chunk_num} processed: total={len(chunk)}, matched={chunk_matched}, missing={chunk_missing}, cumulative_ok={stats.get('rows_ok',0)}"
-                    )
-                    missing_ratio = (chunk_missing / len(chunk)) if len(chunk) else 1.0
-                    if missing_ratio <= 0.05:
-                        success_streak += 1
-                        if success_streak >= success_threshold and current_batch_size < max_batch_size:
-                            next_size = min(max_batch_size, int(math.ceil(current_batch_size * 1.2)))
-                            if next_size == current_batch_size and current_batch_size < max_batch_size:
-                                next_size = min(max_batch_size, current_batch_size + 1)
-                            if next_size != current_batch_size:
-                                console.print(
-                                    f"Success streak {success_streak} reached; increasing batch size to {next_size}"
-                                )
-                                current_batch_size = next_size
-                            success_streak = 0
-                    else:
-                        success_streak = 0
-
-                    if accepted:
-                        copy_rows_to_gemini(conn, accepted, output_table)
-                        conn.commit()
-
-                    if stop:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            try:
+                while True:
+                    if max_rows is not None and processed >= max_rows:
+                        _log("Reached max_rows limit.")
                         break
-                except TimeoutError:
-                    success_streak = 0
-                    if current_batch_size > 1:
-                        current_batch_size = max(1, int(math.floor(current_batch_size * 0.75)))
-                        console.print(f"Timeout encountered; reducing batch size to {current_batch_size}")
-                        continue
-                    else:
-                        # batch size already 1; mark these rows as skipped
-                        ids_to_skip = [r["id"] for r in rows]
-                        conn.executemany(
-                            f"UPDATE {source_table} SET gemini_skipped=1 WHERE id=?",
-                            [(rid,) for rid in ids_to_skip],
-                        )
-                        conn.commit()
-                        console.print(f"Marked {len(ids_to_skip)} rows as gemini_skipped after repeated timeouts.")
-                        current_batch_size = 1
-                        continue
-                except ResponseParseError:
-                    success_streak = 0
-                    if current_batch_size > 1:
-                        current_batch_size = max(1, int(math.floor(current_batch_size * 0.75)))
-                        console.print(f"Invalid JSON response; reducing batch size to {current_batch_size}")
-                        continue
-                    else:
-                        ids_to_skip = [r["id"] for r in rows]
-                        conn.executemany(
-                            f"UPDATE {source_table} SET gemini_skipped=1 WHERE id=?",
-                            [(rid,) for rid in ids_to_skip],
-                        )
-                        conn.commit()
-                        console.print(
-                            f"Marked {len(ids_to_skip)} rows as gemini_skipped after repeated invalid JSON responses."
-                        )
-                        current_batch_size = 1
-                        continue
-        finally:
-            reqs = token_totals.get("requests", 0)
-            if reqs:
-                prompt_total = token_totals.get("input", 0)
-                output_total = token_totals.get("output", 0)
-                total_total = token_totals.get("total", 0)
-                console.print(
-                    f"Gemini token usage totals: requests={reqs}, input={prompt_total}, output={output_total}, total={total_total}",
-                    style='green',
-                )
-                console.print(
-                    "Gemini token usage averages: "
-                    f"input={prompt_total/reqs:.2f}, output={output_total/reqs:.2f}, total={total_total/reqs:.2f}",
-                    style='green',
-                )
-            else:
-                console.print("Gemini token usage: no requests made.", style='green')
+                    if not accounts:
+                        all_accounts_exhausted = True
+                        _log("All Gemini accounts are exhausted.")
+                        break
 
-    console.print(
-        f"Gemini scoring finished; processed {processed} rows; ok={stats.get('rows_ok',0)}, errors={stats.get('errors',0)}",
+                    round_workers = min(workers, len(accounts))
+                    fetch_limit = current_batch_size * round_workers
+                    if max_rows is not None:
+                        fetch_limit = min(fetch_limit, max_rows - processed)
+                        if fetch_limit <= 0:
+                            _log("Reached max_rows limit.")
+                            break
+
+                    rows = conn.execute(pending_sql, (fetch_limit,)).fetchall()
+                    if not rows:
+                        _log("No more rows to process.")
+                        break
+
+                    row_dicts = [dict(r) for r in rows]
+                    chunks: List[List[Dict[str, Any]]] = []
+                    for idx in range(0, len(row_dicts), current_batch_size):
+                        chunks.append(row_dicts[idx : idx + current_batch_size])
+
+                    active_pairs: List[Tuple[Dict[str, Any], List[Dict[str, Any]], Any]] = []
+                    for chunk in chunks[:round_workers]:
+                        account = accounts.popleft()
+                        fut = executor.submit(score_chunk, account, chunk)
+                        active_pairs.append((account, chunk, fut))
+
+                    for account, chunk, fut in active_pairs:
+                        result = fut.result()
+                        for exhausted_key in result.get("exhausted_keys", []):
+                            if exhausted_key not in expired_keys:
+                                expired_keys.add(exhausted_key)
+                                _save_expired(expired_keys)
+
+                        prompt_tokens, output_tokens, total_tokens = result.get("usage", (0, 0, 0))
+                        if prompt_tokens or output_tokens or total_tokens:
+                            _record_usage(prompt_tokens, output_tokens, total_tokens)
+
+                        status = result.get("status")
+                        if status == "ok":
+                            processed += len(chunk)
+                            accepted: List[Dict[str, Any]] = []
+                            scored_items = {
+                                s.id: s.labels for s in result.get("items", []) if hasattr(s, "id") and hasattr(s, "labels")
+                            }
+                            for row in chunk:
+                                payload = scored_items.get(str(row["id"]))
+                                if not payload:
+                                    continue
+                                row_data = dict(row)
+                                row_data["gemini_json"] = payload.model_dump_json(
+                                    indent=None,
+                                    by_alias=True,
+                                    exclude_none=True,
+                                    exclude_unset=True,
+                                    ensure_ascii=False,
+                                )
+                                stats["rows_ok"] += 1
+                                accepted.append(row_data)
+                            chunk_matched = len(accepted)
+                            chunk_missing = len(chunk) - chunk_matched
+                            remaining_rows = max(0, remaining_rows - chunk_matched)
+                            stats["rows_remaining"] = remaining_rows
+                            if accepted:
+                                copy_rows_to_gemini(conn, accepted, output_table)
+                                conn.commit()
+                            missing_ratio = (chunk_missing / len(chunk)) if len(chunk) else 1.0
+                            if missing_ratio <= 0.05:
+                                success_streak += 1
+                                if success_streak >= success_threshold and current_batch_size < max_batch_size:
+                                    next_size = min(max_batch_size, int(math.ceil(current_batch_size * 1.2)))
+                                    if next_size == current_batch_size and current_batch_size < max_batch_size:
+                                        next_size = min(max_batch_size, current_batch_size + 1)
+                                    if next_size != current_batch_size:
+                                        _log(
+                                            f"Success streak {success_streak} reached; increasing batch size to {next_size}"
+                                        )
+                                        current_batch_size = next_size
+                                    success_streak = 0
+                            else:
+                                success_streak = 0
+                        elif status == "timeout":
+                            success_streak = 0
+                            if current_batch_size > 1:
+                                current_batch_size = max(1, int(math.floor(current_batch_size * 0.75)))
+                                _log(
+                                    f"Timeout encountered; reducing batch size to {current_batch_size}",
+                                    account=account["name"],
+                                )
+                            else:
+                                ids_to_skip = [r["id"] for r in chunk]
+                                conn.executemany(
+                                    f"UPDATE {source_table} SET gemini_skipped=1 WHERE id=?",
+                                    [(rid,) for rid in ids_to_skip],
+                                )
+                                conn.commit()
+                                remaining_rows = max(0, remaining_rows - len(ids_to_skip))
+                                stats["rows_remaining"] = remaining_rows
+                                _log(
+                                    f"Marked {len(ids_to_skip)} rows as gemini_skipped after repeated timeouts."
+                                )
+                        elif status == "parse_error":
+                            success_streak = 0
+                            if current_batch_size > 1:
+                                current_batch_size = max(1, int(math.floor(current_batch_size * 0.75)))
+                                _log(
+                                    f"Invalid JSON response; reducing batch size to {current_batch_size}",
+                                    account=account["name"],
+                                )
+                            else:
+                                ids_to_skip = [r["id"] for r in chunk]
+                                conn.executemany(
+                                    f"UPDATE {source_table} SET gemini_skipped=1 WHERE id=?",
+                                    [(rid,) for rid in ids_to_skip],
+                                )
+                                conn.commit()
+                                remaining_rows = max(0, remaining_rows - len(ids_to_skip))
+                                stats["rows_remaining"] = remaining_rows
+                                _log(
+                                    "Marked "
+                                    f"{len(ids_to_skip)} rows as gemini_skipped after repeated invalid JSON responses."
+                                )
+                        else:
+                            success_streak = 0
+                            err = result.get("error")
+                            if err:
+                                _log(f"Gemini worker error: {err}", account=account["name"])
+
+                        if account["keys"]:
+                            accounts.append(account)
+                        else:
+                            _log("Account exhausted and disabled.", account=account["name"])
+                            if not accounts:
+                                all_accounts_exhausted = True
+            finally:
+                reqs = token_totals.get("requests", 0)
+                if reqs:
+                    prompt_total = token_totals.get("input", 0)
+                    output_total = token_totals.get("output", 0)
+                    total_total = token_totals.get("total", 0)
+                    _log(
+                        f"Gemini token usage totals: requests={reqs}, input={prompt_total}, output={output_total}, total={total_total}",
+                        style='green',
+                    )
+                    _log(
+                        "Gemini token usage averages: "
+                        f"input={prompt_total/reqs:.2f}, output={output_total/reqs:.2f}, total={total_total/reqs:.2f}",
+                        style='green',
+                    )
+                else:
+                    _log("Gemini token usage: no requests made.", style='green')
+
+    _log(
+        f"Gemini scoring finished; total={stats.get('rows_total',0)}, remaining={stats.get('rows_remaining',0)}, ok={stats.get('rows_ok',0)}, errors={stats.get('errors',0)}",
         style='green',
     )
+    if all_accounts_exhausted and stats.get("rows_remaining", 0) > 0:
+        raise typer.Exit(code=1)
     if report_path:
         ensure_parent(report_path)
         report_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
-        console.print(f"Wrote Gemini report to {report_path}")
+        _log(f"Wrote Gemini report to {report_path}")
 
 
 def export_parquet_cmd(

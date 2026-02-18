@@ -208,21 +208,46 @@ INPUT:
 
 def load_keys(path: Path) -> List[str]:
     """Load Gemini API keys from a YAML list or mapping."""
+    accounts = load_account_keys(path)
+    keys: List[str] = []
+    for account_keys in accounts.values():
+        keys.extend(account_keys)
+    if not keys:
+        raise ValueError("Gemini keys file has no usable keys")
+    return keys
+
+
+def load_account_keys(path: Path) -> Dict[str, List[str]]:
+    """Load Gemini API keys grouped by account from YAML."""
     if not path.exists():
         raise FileNotFoundError(f"No Gemini keys file at {path}")
     data = yaml.safe_load(path.read_text())
     if not data:
         raise ValueError("Gemini keys file is empty")
+    accounts: Dict[str, List[str]] = {}
+
+    def _clean_keys(values: Any) -> List[str]:
+        if isinstance(values, list):
+            raw = values
+        else:
+            raw = [values]
+        return [str(k).strip() for k in raw if k and str(k).strip()]
+
     if isinstance(data, dict):
-        keys = list(data.values())
+        for account, value in data.items():
+            cleaned = _clean_keys(value)
+            if cleaned:
+                accounts[str(account)] = cleaned
     elif isinstance(data, list):
-        keys = data
+        for idx, value in enumerate(data, start=1):
+            cleaned = _clean_keys(value)
+            if cleaned:
+                accounts[f"account_{idx}"] = cleaned
     else:
         raise ValueError("Gemini keys file must be a list or mapping")
-    keys = [k.strip() for k in keys if k and str(k).strip()]
-    if not keys:
+    if not accounts:
         raise ValueError("Gemini keys file has no usable keys")
-    return keys
+    return accounts
 
 
 class KeyRotator:

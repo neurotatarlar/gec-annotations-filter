@@ -41,6 +41,7 @@ python -m app.cli toxicity --source-table dedup_segments --output-table toxicity
 python -m app.cli gemini --source-table toxicity_segments --output-table llm_segments --keys-path data/gemini_keys.yaml --model models/gemini-3-flash-preview
 # custom prompt: --prompt-path path/to/prompt.txt
 # adaptive batching: --batch-size 64 --max-batch-size 512
+# account-parallel requests: --workers 3 (default 1; capped by account count)
 ```
 
 5) **Export to Parquet**

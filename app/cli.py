@@ -74,6 +74,11 @@ def gemini_score(
     prompt_path: Optional[Path] = typer.Option(None, help="Optional path to custom prompt; defaults to built-in."),
     batch_size: int = typer.Option(64, help="Rows to read from DB per loop and send per Gemini request."),
     max_batch_size: int = typer.Option(512, help="Maximum batch size for adaptive Gemini requests."),
+    workers: int = typer.Option(1, help="Number of parallel Gemini workers (capped by account count)."),
+    account_cooldown_seconds: int = typer.Option(
+        60,
+        help="Cooldown applied to an account after quota/rate-limit errors before trying its next key.",
+    ),
     max_rows: Optional[int] = typer.Option(None, help="Optional limit for debugging."),
     report_path: Optional[Path] = typer.Option(Path("reports/gemini_report.json"), help="Write JSON counters for Gemini stage."),
 ):
@@ -87,6 +92,8 @@ def gemini_score(
         prompt_path,
         batch_size,
         max_batch_size,
+        workers,
+        account_cooldown_seconds,
         max_rows,
         report_path,
     )
