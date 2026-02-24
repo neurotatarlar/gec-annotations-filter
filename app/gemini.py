@@ -1,7 +1,6 @@
 """Gemini prompt templates, schema validation, and request helpers."""
 
 import json
-from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Any
 
@@ -346,7 +345,7 @@ def _validate_items(data: Any) -> List[Dict[str, Any]]:
             raise ValueError("Each item must contain 'id' and 'labels'")
         labels = _validate_labels(item["labels"])
         scored = ScoredItem(id=str(item["id"]), labels=labels)
-        validated.append({"id": scored.id, "labels": asdict(scored.labels)})
+        validated.append({"id": scored.id, "labels": scored.labels.model_dump()})
     return validated
 
 
