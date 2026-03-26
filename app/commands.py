@@ -5,6 +5,7 @@ import math
 import hashlib
 import random
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 import sqlite3
@@ -138,6 +139,211 @@ def _should_flush_gemini_writes(
     if max_interval_seconds <= 0:
         return True
     return (now - last_commit_at) >= float(max_interval_seconds)
+
+
+@dataclass
+class GeminiAccountState:
+    """Mutable per-account scheduler state for Gemini workers."""
+
+    name: str
+    keys: List[str]
+    idx: int = 0
+    batch_size: int = 1
+    success_streak: int = 0
+
+
+@dataclass
+class GeminiWorkItem:
+    """A unit of row work scheduled for one Gemini request."""
+
+    rows: List[Dict[str, Any]]
+    attempts: int = 0
+
+
+@dataclass
+class GeminiWorkerResult:
+    """Normalized worker response consumed by the scheduler loop."""
+
+    status: str
+    items: List[ScoredItem] = field(default_factory=list)
+    error: Optional[str] = None
+    usage: Tuple[int, int, int] = (0, 0, 0)
+    exhausted_keys: List[str] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
+    cooldown_seconds: float = 0.0
+    account_delay_seconds: float = 0.0
+
+
+class _GeminiResponseParseError(RuntimeError):
+    """Raised when Gemini returns invalid JSON for the expected schema."""
+
+
+def _load_expired_keys(expired_path: Path) -> set[str]:
+    """Load keys marked as exhausted on previous runs."""
+    if not expired_path.exists():
+        return set()
+    try:
+        return set(json.loads(expired_path.read_text()))
+    except Exception:
+        try:
+            return set(k.strip() for k in expired_path.read_text().splitlines() if k.strip())
+        except Exception:
+            return set()
+
+
+def _save_expired_keys(expired_path: Path, expired: set[str]) -> None:
+    """Persist exhausted keys so future runs skip them."""
+    expired_path.write_text(json.dumps(sorted(expired), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _usage_val(usage: Any, key: str) -> int:
+    """Read an integer usage field from dict- or object-like metadata."""
+    if usage is None:
+        return 0
+    if isinstance(usage, dict):
+        try:
+            return int(usage.get(key) or 0)
+        except Exception:
+            return 0
+    try:
+        return int(getattr(usage, key, 0) or 0)
+    except Exception:
+        return 0
+
+
+def _usage_from_meta(usage: Any) -> tuple[int, int, int]:
+    """Extract usage counters from Gemini metadata."""
+    prompt_tokens = _usage_val(usage, "prompt_token_count")
+    output_tokens = _usage_val(usage, "candidates_token_count")
+    total_tokens = _usage_val(usage, "total_token_count")
+    return prompt_tokens, output_tokens, total_tokens
+
+
+def _next_account_key(account: GeminiAccountState) -> str:
+    """Rotate keys within one account."""
+    key = account.keys[account.idx % len(account.keys)]
+    account.idx = (account.idx + 1) % len(account.keys)
+    return key
+
+
+def _build_account_pool(
+    raw_accounts: Dict[str, List[str]],
+    expired_keys: set[str],
+    batch_size: int,
+) -> List[GeminiAccountState]:
+    """Create account state objects while filtering out expired keys."""
+    account_pool: List[GeminiAccountState] = []
+    for account_name, account_keys in raw_accounts.items():
+        usable_keys = [k for k in account_keys if k not in expired_keys]
+        if usable_keys:
+            account_pool.append(
+                GeminiAccountState(
+                    name=account_name,
+                    keys=usable_keys,
+                    idx=0,
+                    batch_size=batch_size,
+                    success_streak=0,
+                )
+            )
+    return account_pool
+
+
+def _score_chunk_with_gemini(
+    account: GeminiAccountState,
+    chunk: List[Dict[str, Any]],
+    *,
+    model: str,
+    prompt: str,
+    account_cooldown_seconds: int,
+    log_fn,
+) -> GeminiWorkerResult:
+    """Score one chunk with retry/key-rotation logic for a single account."""
+    last_error: Optional[str] = None
+    exhausted_in_call: List[str] = []
+    tries = 0
+    success_inter_request_delay_seconds = 5.0
+    while account.keys and tries < len(account.keys) + 1:
+        tries += 1
+        key = _next_account_key(account)
+        try:
+            req_started = time.monotonic()
+            log_fn(f"Sending Gemini request for {len(chunk)} rows.", account=account.name)
+            client = genai.Client(api_key=key)
+            prompt_text = build_batch_prompt(prompt, [{"id": r["id"], "text": r["text"]} for r in chunk])
+            resp_text, usage = call_gemini(client, model, prompt_text, schema=list[ScoredItem])
+            prompt_tokens, output_tokens, total_tokens = _usage_from_meta(usage)
+            ta = TypeAdapter(List[ScoredItem])
+            try:
+                items = ta.validate_python(json.loads(resp_text))
+            except Exception as exc:
+                raise _GeminiResponseParseError(str(exc)) from exc
+            elapsed_seconds = time.monotonic() - req_started
+            log_fn(
+                f"Gemini request completed for {len(chunk)} rows in {elapsed_seconds:.1f}s.",
+                account=account.name,
+            )
+            return GeminiWorkerResult(
+                status="ok",
+                items=items,
+                usage=(prompt_tokens, output_tokens, total_tokens),
+                exhausted_keys=exhausted_in_call,
+                elapsed_seconds=elapsed_seconds,
+                account_delay_seconds=success_inter_request_delay_seconds,
+            )
+        except _GeminiResponseParseError as exc:
+            return GeminiWorkerResult(
+                status="parse_error",
+                error=str(exc),
+                exhausted_keys=exhausted_in_call,
+            )
+        except Exception as exc:  # pragma: no cover - network errors
+            import traceback
+
+            last_error = str(exc)
+            if "UNAVAILABLE" in last_error or "overloaded" in last_error.lower():
+                return GeminiWorkerResult(
+                    status="overloaded",
+                    error=last_error,
+                    exhausted_keys=exhausted_in_call,
+                    cooldown_seconds=60,
+                )
+            if "DEADLINE_EXCEEDED" in last_error or "timed out" in last_error.lower():
+                return GeminiWorkerResult(
+                    status="timeout",
+                    error=last_error,
+                    exhausted_keys=exhausted_in_call,
+                )
+            if "RESOURCE_EXHAUSTED" in last_error or "quota" in last_error.lower():
+                log_fn("Key appears exhausted; marking as expired.", account=account.name)
+                exhausted_in_call.append(key)
+                account.keys = [k for k in account.keys if k != key]
+                if account.keys:
+                    account.idx = account.idx % len(account.keys)
+                    return GeminiWorkerResult(
+                        status="cooldown",
+                        error=last_error,
+                        exhausted_keys=exhausted_in_call,
+                        cooldown_seconds=float(account_cooldown_seconds),
+                    )
+                continue
+            traceback.print_exc()
+            return GeminiWorkerResult(
+                status="transient_error",
+                error=last_error,
+                exhausted_keys=exhausted_in_call,
+                cooldown_seconds=5,
+            )
+    if not account.keys:
+        return GeminiWorkerResult(
+            status="account_exhausted",
+            error="Account has no usable keys left",
+            exhausted_keys=exhausted_in_call,
+        )
+    return GeminiWorkerResult(
+        status="error",
+        error=last_error,
+        exhausted_keys=exhausted_in_call,
+    )
 
 
 def _fetch_remote_revision(dataset: str) -> Optional[str]:
@@ -451,22 +657,6 @@ def gemini_cmd(
 
     expired_path = keys_path.with_suffix(keys_path.suffix + ".expired")
 
-    def _load_expired() -> set[str]:
-        """Load keys already marked exhausted on previous runs."""
-        if not expired_path.exists():
-            return set()
-        try:
-            return set(json.loads(expired_path.read_text()))
-        except Exception:
-            try:
-                return set(k.strip() for k in expired_path.read_text().splitlines() if k.strip())
-            except Exception:
-                return set()
-
-    def _save_expired(expired: set[str]) -> None:
-        """Persist exhausted keys so retries skip them."""
-        expired_path.write_text(json.dumps(sorted(expired), ensure_ascii=False, indent=2), encoding="utf-8")
-
     def _log(message: str, style: Optional[str] = None, account: Optional[str] = None) -> None:
         """Print a log line with thread/account context."""
         thread_name = threading.current_thread().name
@@ -476,31 +666,6 @@ def gemini_cmd(
             console.print(text, style=style)
         else:
             console.print(text)
-
-    class ResponseParseError(RuntimeError):
-        """Raised when Gemini returns invalid JSON for the expected schema."""
-        pass
-
-    def _usage_val(usage, key: str) -> int:
-        """Read an integer usage field from dict- or object-like metadata."""
-        if usage is None:
-            return 0
-        if isinstance(usage, dict):
-            try:
-                return int(usage.get(key) or 0)
-            except Exception:
-                return 0
-        try:
-            return int(getattr(usage, key, 0) or 0)
-        except Exception:
-            return 0
-
-    def _usage_from_meta(usage) -> tuple[int, int, int]:
-        """Extract usage counters from Gemini metadata."""
-        prompt_tokens = _usage_val(usage, "prompt_token_count")
-        output_tokens = _usage_val(usage, "candidates_token_count")
-        total_tokens = _usage_val(usage, "total_token_count")
-        return prompt_tokens, output_tokens, total_tokens
 
     def _record_usage(
         prompt_tokens: int,
@@ -524,146 +689,9 @@ def gemini_cmd(
             account=account_name,
         )
 
-    def _next_account_key(account: Dict[str, Any]) -> str:
-        """Rotate keys within one account."""
-        key = account["keys"][account["idx"] % len(account["keys"])]
-        account["idx"] = (account["idx"] + 1) % len(account["keys"])
-        return key
-
-    def score_chunk(
-        account: Dict[str, Any],
-        chunk: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """
-        Score one chunk with retry logic within a single account.
-
-        Returns a structured result so the caller can update counters and decide
-        whether to shrink batch size or disable exhausted accounts.
-        """
-        last_error: Optional[str] = None
-        exhausted_in_call: List[str] = []
-        tries = 0
-        success_inter_request_delay_seconds = 5.0
-        while account["keys"] and tries < len(account["keys"]) + 1:
-            tries += 1
-            key = _next_account_key(account)
-            try:
-                req_started = time.monotonic()
-                _log(f"Sending Gemini request for {len(chunk)} rows.", account=account["name"])
-                client = genai.Client(api_key=key)
-                prompt_text = build_batch_prompt(prompt, [{"id": r["id"], "text": r["text"]} for r in chunk])
-                resp_text, usage = call_gemini(client, model, prompt_text, schema=list[ScoredItem])
-                prompt_tokens, output_tokens, total_tokens = _usage_from_meta(usage)
-                ta = TypeAdapter(List[ScoredItem])
-                try:
-                    items = ta.validate_python(json.loads(resp_text))
-                except Exception as exc:
-                    raise ResponseParseError(str(exc)) from exc
-                elapsed_seconds = time.monotonic() - req_started
-                _log(
-                    f"Gemini request completed for {len(chunk)} rows in {elapsed_seconds:.1f}s.",
-                    account=account["name"],
-                )
-                return {
-                    "status": "ok",
-                    "items": items,
-                    "error": None,
-                    "usage": (prompt_tokens, output_tokens, total_tokens),
-                    "exhausted_keys": exhausted_in_call,
-                    "elapsed_seconds": elapsed_seconds,
-                    "account_delay_seconds": success_inter_request_delay_seconds,
-                }
-            except ResponseParseError as exc:
-                return {
-                    "status": "parse_error",
-                    "items": [],
-                    "error": str(exc),
-                    "usage": (0, 0, 0),
-                    "exhausted_keys": exhausted_in_call,
-                    "elapsed_seconds": 0.0,
-                }
-            except Exception as exc:  # pragma: no cover - network errors
-                import traceback
-
-                last_error = str(exc)
-                if "UNAVAILABLE" in last_error or "overloaded" in last_error.lower():
-                    return {
-                        "status": "overloaded",
-                        "items": [],
-                        "error": last_error,
-                        "usage": (0, 0, 0),
-                        "exhausted_keys": exhausted_in_call,
-                        "elapsed_seconds": 0.0,
-                        "cooldown_seconds": 60,
-                    }
-                if "DEADLINE_EXCEEDED" in last_error or "timed out" in last_error.lower():
-                    return {
-                        "status": "timeout",
-                        "items": [],
-                        "error": last_error,
-                        "usage": (0, 0, 0),
-                        "exhausted_keys": exhausted_in_call,
-                        "elapsed_seconds": 0.0,
-                    }
-                if "RESOURCE_EXHAUSTED" in last_error or "quota" in last_error.lower():
-                    _log("Key appears exhausted; marking as expired.", account=account["name"])
-                    exhausted_in_call.append(key)
-                    account["keys"] = [k for k in account["keys"] if k != key]
-                    if account["keys"]:
-                        account["idx"] = account["idx"] % len(account["keys"])
-                        return {
-                            "status": "cooldown",
-                            "items": [],
-                            "error": last_error,
-                            "usage": (0, 0, 0),
-                            "exhausted_keys": exhausted_in_call,
-                            "cooldown_seconds": account_cooldown_seconds,
-                            "elapsed_seconds": 0.0,
-                        }
-                    continue
-                traceback.print_exc()
-                return {
-                    "status": "transient_error",
-                    "items": [],
-                    "error": last_error,
-                    "usage": (0, 0, 0),
-                    "exhausted_keys": exhausted_in_call,
-                    "elapsed_seconds": 0.0,
-                    "cooldown_seconds": 5,
-                }
-        if not account["keys"]:
-            return {
-                "status": "account_exhausted",
-                "items": [],
-                "error": "Account has no usable keys left",
-                "usage": (0, 0, 0),
-                "exhausted_keys": exhausted_in_call,
-                "elapsed_seconds": 0.0,
-            }
-        return {
-            "status": "error",
-            "items": [],
-            "error": last_error,
-            "usage": (0, 0, 0),
-            "exhausted_keys": exhausted_in_call,
-            "elapsed_seconds": 0.0,
-        }
-
-    expired_keys = _load_expired()
+    expired_keys = _load_expired_keys(expired_path)
     raw_accounts = load_account_keys(keys_path)
-    account_pool: List[Dict[str, Any]] = []
-    for account_name, account_keys in raw_accounts.items():
-        usable_keys = [k for k in account_keys if k not in expired_keys]
-        if usable_keys:
-            account_pool.append(
-                {
-                    "name": account_name,
-                    "keys": usable_keys,
-                    "idx": 0,
-                    "batch_size": None,  # initialized after batch size normalization
-                    "success_streak": 0,
-                }
-            )
+    account_pool = _build_account_pool(raw_accounts, expired_keys, batch_size=max(1, batch_size))
     if not account_pool:
         _log("No usable Gemini accounts after filtering expired keys.")
         raise typer.Exit(code=1)
@@ -696,11 +724,11 @@ def gemini_cmd(
     transient_cooldown_jitter_fraction = 0.20
     scheduler_rng = random.Random()
     for account in account_pool:
-        account["batch_size"] = batch_size
-        account_token_totals[account["name"]] = Counter()
-        account_runtime_totals[account["name"]] = Counter()
+        account.batch_size = batch_size
+        account_token_totals[account.name] = Counter()
+        account_runtime_totals[account.name] = Counter()
     ready_accounts = deque(account_pool)
-    cooling_accounts: List[Tuple[float, int, Dict[str, Any]]] = []
+    cooling_accounts: List[Tuple[float, int, GeminiAccountState]] = []
     cooldown_seq = 0
     all_accounts_exhausted = False
 
@@ -745,11 +773,11 @@ def gemini_cmd(
                 source_exhausted = False
                 rows_reserved = 0
                 queued_rows: deque[Dict[str, Any]] = deque()
-                retry_chunks: deque[Dict[str, Any]] = deque()
+                retry_chunks: deque[GeminiWorkItem] = deque()
                 retry_rows_buffered = 0
                 pending_llm_writes: List[Dict[str, Any]] = []
                 last_db_commit_at = time.monotonic()
-                inflight: Dict[Any, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+                inflight: Dict[Any, Tuple[GeminiAccountState, GeminiWorkItem]] = {}
                 next_scheduler_log_at = time.monotonic() + scheduler_log_interval_seconds
                 dispatch_turn = 0
 
@@ -757,7 +785,7 @@ def gemini_cmd(
                     now = time.monotonic()
                     while cooling_accounts and cooling_accounts[0][0] <= now:
                         _, _, acc = heapq.heappop(cooling_accounts)
-                        if acc["keys"]:
+                        if acc.keys:
                             ready_accounts.append(acc)
 
                 def _log_scheduler_metrics(force: bool = False) -> None:
@@ -775,29 +803,29 @@ def gemini_cmd(
                         f"remaining={stats.get('rows_remaining', 0)}, rows_ok={stats.get('rows_ok', 0)}"
                     )
 
-                def _account_batch_size(account: Dict[str, Any]) -> int:
-                    return max(1, min(max_batch_size, int(account.get("batch_size") or batch_size)))
+                def _account_batch_size(account: GeminiAccountState) -> int:
+                    return max(1, min(max_batch_size, int(account.batch_size or batch_size)))
 
-                def _reset_account_success(account: Dict[str, Any]) -> None:
-                    account["success_streak"] = 0
+                def _reset_account_success(account: GeminiAccountState) -> None:
+                    account.success_streak = 0
 
-                def _grow_account_batch(account: Dict[str, Any]) -> None:
+                def _grow_account_batch(account: GeminiAccountState) -> None:
                     cur = _account_batch_size(account)
-                    streak = int(account.get("success_streak", 0))
+                    streak = int(account.success_streak)
                     if streak < success_threshold or cur >= max_batch_size:
                         return
                     next_size = min(max_batch_size, int(math.ceil(cur * 1.2)))
                     if next_size == cur and cur < max_batch_size:
                         next_size = min(max_batch_size, cur + 1)
                     if next_size != cur:
-                        account["batch_size"] = next_size
+                        account.batch_size = next_size
                         _log(
                             f"Success streak {streak} reached; increasing batch size to {next_size}",
-                            account=account["name"],
+                            account=account.name,
                         )
-                    account["success_streak"] = 0
+                    account.success_streak = 0
 
-                def _shrink_account_batch(account: Dict[str, Any], reason: str) -> None:
+                def _shrink_account_batch(account: GeminiAccountState, reason: str) -> None:
                     cur = _account_batch_size(account)
                     _reset_account_success(account)
                     if cur <= 1:
@@ -806,8 +834,8 @@ def gemini_cmd(
                     if next_size == cur and cur > 1:
                         next_size = cur - 1
                     if next_size != cur:
-                        account["batch_size"] = next_size
-                        _log(f"{reason}; reducing batch size to {next_size}", account=account["name"])
+                        account.batch_size = next_size
+                        _log(f"{reason}; reducing batch size to {next_size}", account=account.name)
 
                 def _skip_rows(rows_to_skip: List[Dict[str, Any]], message: str) -> None:
                     nonlocal remaining_rows
@@ -826,16 +854,16 @@ def gemini_cmd(
                     stats["rows_retry_exhausted"] += len(ids_to_skip)
                     _log(message.format(n=len(ids_to_skip)))
 
-                def _queue_retry_work(work_item: Dict[str, Any]) -> None:
+                def _queue_retry_work(work_item: GeminiWorkItem) -> None:
                     nonlocal retry_rows_buffered
-                    rows_part = list(work_item.get("rows") or [])
+                    rows_part = list(work_item.rows)
                     if not rows_part:
                         return
-                    attempts = int(work_item.get("attempts", 0)) + 1
+                    attempts = int(work_item.attempts) + 1
                     if attempts > max_chunk_retries:
                         _skip_rows(rows_part, "Marked {n} rows as gemini_skipped after retry limit.")
                         return
-                    retry_chunks.appendleft({"rows": rows_part, "attempts": attempts})
+                    retry_chunks.appendleft(GeminiWorkItem(rows=rows_part, attempts=attempts))
                     retry_rows_buffered += len(rows_part)
 
                 def _flush_pending_llm_writes(*, force: bool = False) -> None:
@@ -868,43 +896,43 @@ def gemini_cmd(
                     if not rows_part:
                         return
                     if split_size is None or split_size <= 0 or len(rows_part) <= split_size:
-                        _queue_retry_work({"rows": rows_part, "attempts": attempts})
+                        _queue_retry_work(GeminiWorkItem(rows=rows_part, attempts=attempts))
                         return
                     for i in range(len(rows_part), 0, -split_size):
                         start = max(0, i - split_size)
-                        _queue_retry_work({"rows": rows_part[start:i], "attempts": attempts})
+                        _queue_retry_work(GeminiWorkItem(rows=rows_part[start:i], attempts=attempts))
 
-                def _split_rows_for_account(rows_part: List[Dict[str, Any]], account: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+                def _split_rows_for_account(rows_part: List[Dict[str, Any]], account: GeminiAccountState) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
                     take_n = _account_batch_size(account)
                     if len(rows_part) <= take_n:
                         return rows_part, []
                     return rows_part[:take_n], rows_part[take_n:]
 
-                def _next_work_item_for_account(account: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                def _next_work_item_for_account(account: GeminiAccountState) -> Optional[GeminiWorkItem]:
                     nonlocal dispatch_turn, retry_rows_buffered
 
-                    def _pop_retry() -> Optional[Dict[str, Any]]:
+                    def _pop_retry() -> Optional[GeminiWorkItem]:
                         nonlocal retry_rows_buffered
                         if not retry_chunks:
                             return None
                         item = retry_chunks.popleft()
-                        rows_part = list(item["rows"])
+                        rows_part = list(item.rows)
                         retry_rows_buffered = max(0, retry_rows_buffered - len(rows_part))
-                        attempts = int(item.get("attempts", 0))
+                        attempts = int(item.attempts)
                         head, tail = _split_rows_for_account(rows_part, account)
                         if tail:
-                            retry_chunks.appendleft({"rows": tail, "attempts": attempts})
+                            retry_chunks.appendleft(GeminiWorkItem(rows=tail, attempts=attempts))
                             retry_rows_buffered += len(tail)
-                        return {"rows": head, "attempts": attempts}
+                        return GeminiWorkItem(rows=head, attempts=attempts)
 
-                    def _pop_fresh() -> Optional[Dict[str, Any]]:
+                    def _pop_fresh() -> Optional[GeminiWorkItem]:
                         if not queued_rows:
                             return None
                         take_n = _account_batch_size(account)
                         rows_part: List[Dict[str, Any]] = []
                         while queued_rows and len(rows_part) < take_n:
                             rows_part.append(queued_rows.popleft())
-                        return {"rows": rows_part, "attempts": 0} if rows_part else None
+                        return GeminiWorkItem(rows=rows_part, attempts=0) if rows_part else None
 
                     if retry_chunks and queued_rows:
                         prefer_retry = (dispatch_turn % 4) == 0  # 1 retry : 3 fresh
@@ -927,7 +955,7 @@ def gemini_cmd(
                         queue_factor=prefetch_queue_factor,
                         fetch_factor=prefetch_fetch_factor,
                     )
-                    inflight_rows = sum(len(item["rows"]) for _, item in inflight.values())
+                    inflight_rows = sum(len(item.rows) for _, item in inflight.values())
                     buffered_rows = len(queued_rows) + retry_rows_buffered + inflight_rows
                     if buffered_rows >= queue_watermark_rows:
                         return
@@ -966,7 +994,15 @@ def gemini_cmd(
                             if work_item is None:
                                 ready_accounts.appendleft(account)
                                 break
-                        fut = executor.submit(score_chunk, account, work_item["rows"])
+                        fut = executor.submit(
+                            _score_chunk_with_gemini,
+                            account,
+                            work_item.rows,
+                            model=model,
+                            prompt=prompt,
+                            account_cooldown_seconds=account_cooldown_seconds,
+                            log_fn=_log,
+                        )
                         inflight[fut] = (account, work_item)
 
                     if not inflight:
@@ -1007,28 +1043,28 @@ def gemini_cmd(
                     done, _ = wait(set(inflight.keys()), return_when=FIRST_COMPLETED)
                     for fut in done:
                         account, work_item = inflight.pop(fut)
-                        chunk = work_item["rows"]
+                        chunk = work_item.rows
                         result = fut.result()
-                        for exhausted_key in result.get("exhausted_keys", []):
+                        for exhausted_key in result.exhausted_keys:
                             if exhausted_key not in expired_keys:
                                 expired_keys.add(exhausted_key)
-                                _save_expired(expired_keys)
+                                _save_expired_keys(expired_path, expired_keys)
 
-                        prompt_tokens, output_tokens, total_tokens = result.get("usage", (0, 0, 0))
-                        elapsed_seconds = float(result.get("elapsed_seconds") or 0.0)
-                        account_runtime_totals[account["name"]]["rows"] += len(chunk)
-                        account_runtime_totals[account["name"]]["requests"] += 1
-                        account_runtime_totals[account["name"]]["elapsed_seconds"] += elapsed_seconds
+                        prompt_tokens, output_tokens, total_tokens = result.usage
+                        elapsed_seconds = float(result.elapsed_seconds or 0.0)
+                        account_runtime_totals[account.name]["rows"] += len(chunk)
+                        account_runtime_totals[account.name]["requests"] += 1
+                        account_runtime_totals[account.name]["elapsed_seconds"] += elapsed_seconds
                         if prompt_tokens or output_tokens or total_tokens:
-                            _record_usage(prompt_tokens, output_tokens, total_tokens, account_name=account["name"])
+                            _record_usage(prompt_tokens, output_tokens, total_tokens, account_name=account.name)
 
-                        status = result.get("status")
+                        status = result.status
                         if status == "ok":
                             accepted: List[Dict[str, Any]] = []
                             missing_rows: List[Dict[str, Any]] = []
                             scored_items = {
                                 s.id: s.labels
-                                for s in result.get("items", [])
+                                for s in result.items
                                 if hasattr(s, "id") and hasattr(s, "labels")
                             }
                             for row in chunk:
@@ -1056,13 +1092,13 @@ def gemini_cmd(
                                 _flush_pending_llm_writes()
                             if missing_rows:
                                 if _account_batch_size(account) > 1:
-                                    retry_attempts = int(work_item.get("attempts", 0))
+                                    retry_attempts = int(work_item.attempts)
                                     if chunk_missing > 1 and missing_ratio >= 0.5:
                                         split_size = max(1, min(_account_batch_size(account) // 2, len(missing_rows)))
                                         if split_size < len(missing_rows):
                                             _log(
                                                 f"Partial response missing {chunk_missing}/{len(chunk)} rows; splitting retries into chunks of {split_size}",
-                                                account=account["name"],
+                                                account=account.name,
                                             )
                                         _queue_retry_rows(
                                             missing_rows,
@@ -1070,14 +1106,14 @@ def gemini_cmd(
                                             split_size=split_size,
                                         )
                                     else:
-                                        _queue_retry_work({"rows": missing_rows, "attempts": retry_attempts})
+                                        _queue_retry_work(GeminiWorkItem(rows=missing_rows, attempts=retry_attempts))
                                 else:
                                     _skip_rows(
                                         missing_rows,
                                         "Marked {n} rows as gemini_skipped after missing ids in Gemini response.",
                                     )
                             if missing_ratio <= 0.05:
-                                account["success_streak"] = int(account.get("success_streak", 0)) + 1
+                                account.success_streak = int(account.success_streak) + 1
                                 _grow_account_batch(account)
                             else:
                                 _reset_account_success(account)
@@ -1103,12 +1139,12 @@ def gemini_cmd(
                             stats["cooldowns"] += 1
                             _reset_account_success(account)
                             _queue_retry_work(work_item)
-                            if account["keys"]:
-                                cooldown_seconds = max(0, int(result.get("cooldown_seconds", account_cooldown_seconds) or 0))
+                            if account.keys:
+                                cooldown_seconds = max(0, int(result.cooldown_seconds or account_cooldown_seconds))
                                 if cooldown_seconds > 0:
                                     _log(
                                         f"Cooling down account for {cooldown_seconds}s before next request.",
-                                        account=account["name"],
+                                        account=account.name,
                                     )
                                     cooldown_seq += 1
                                     heapq.heappush(
@@ -1118,12 +1154,12 @@ def gemini_cmd(
                                 else:
                                     ready_accounts.append(account)
                             else:
-                                _log("Account exhausted and disabled.", account=account["name"])
+                                _log("Account exhausted and disabled.", account=account.name)
                         elif status == "overloaded":
                             stats["overloaded"] += 1
                             _reset_account_success(account)
                             _queue_retry_work(work_item)
-                            base_cooldown_seconds = max(1, float(result.get("cooldown_seconds", 60) or 60))
+                            base_cooldown_seconds = max(1, float(result.cooldown_seconds or 60))
                             cooldown_seconds = _gemini_jittered_seconds(
                                 base_cooldown_seconds,
                                 overload_cooldown_jitter_fraction,
@@ -1131,7 +1167,7 @@ def gemini_cmd(
                             )
                             _log(
                                 f"Gemini overloaded; backing off account for {cooldown_seconds:.1f}s.",
-                                account=account["name"],
+                                account=account.name,
                             )
                             cooldown_seq += 1
                             heapq.heappush(
@@ -1142,17 +1178,17 @@ def gemini_cmd(
                             stats["transient_errors"] += 1
                             _reset_account_success(account)
                             _queue_retry_work(work_item)
-                            base_cooldown_seconds = max(1, float(result.get("cooldown_seconds", 5) or 5))
+                            base_cooldown_seconds = max(1, float(result.cooldown_seconds or 5))
                             cooldown_seconds = _gemini_jittered_seconds(
                                 base_cooldown_seconds,
                                 transient_cooldown_jitter_fraction,
                                 rng=scheduler_rng,
                             )
-                            err = result.get("error")
+                            err = result.error
                             if err:
                                 _log(
                                     f"Transient worker error; backing off account for {cooldown_seconds:.1f}s: {err}",
-                                    account=account["name"],
+                                    account=account.name,
                                 )
                             cooldown_seq += 1
                             heapq.heappush(
@@ -1162,27 +1198,27 @@ def gemini_cmd(
                         else:
                             _reset_account_success(account)
                             _queue_retry_work(work_item)
-                            err = result.get("error")
+                            err = result.error
                             if err:
-                                _log(f"Gemini worker error: {err}", account=account["name"])
+                                _log(f"Gemini worker error: {err}", account=account.name)
 
                         if status == "ok":
-                            delay_seconds = float(result.get("account_delay_seconds") or 0.0)
-                            if account["keys"] and delay_seconds > 0:
+                            delay_seconds = float(result.account_delay_seconds or 0.0)
+                            if account.keys and delay_seconds > 0:
                                 cooldown_seq += 1
                                 heapq.heappush(
                                     cooling_accounts,
                                     (time.monotonic() + delay_seconds, cooldown_seq, account),
                                 )
-                            elif account["keys"]:
+                            elif account.keys:
                                 ready_accounts.append(account)
                             else:
-                                _log("Account exhausted and disabled.", account=account["name"])
+                                _log("Account exhausted and disabled.", account=account.name)
                         elif status not in {"cooldown", "overloaded", "transient_error"}:
-                            if account["keys"]:
+                            if account.keys:
                                 ready_accounts.append(account)
                             else:
-                                _log("Account exhausted and disabled.", account=account["name"])
+                                _log("Account exhausted and disabled.", account=account.name)
                 _flush_pending_llm_writes(force=True)
                 _log_scheduler_metrics(force=True)
             finally:
