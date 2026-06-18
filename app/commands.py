@@ -45,6 +45,7 @@ from .processing import (
     tokenize_words,
 )
 from .storage import (
+    _validate_table_name,
     copy_rows_to_dedup,
     copy_rows_to_gemini,
     copy_rows_to_toxicity,
@@ -1303,6 +1304,196 @@ def _stream_table_to_parquet(
             writer.write_table(batch.to_arrow())
             written += len(rows)
     return written
+
+
+HF_EXPORT_SCHEMA = pa.schema(
+    [
+        ("id", pa.string()),
+        ("text", pa.string()),
+        ("toxicity_label", pa.int64()),
+        ("toxicity_score", pa.float64()),
+        ("main_language", pa.string()),
+        ("tatar_prob", pa.float64()),
+        ("russian_share", pa.float64()),
+        ("error_share", pa.float64()),
+        ("error_density", pa.string()),
+        ("main_error_type", pa.string()),
+        ("non_fluent_prob", pa.float64()),
+        ("meaning_clarity", pa.float64()),
+        ("noise_score", pa.float64()),
+        ("overall_gec_usefulness", pa.float64()),
+    ]
+)
+
+
+def _flatten_hf_export_row(row: sqlite3.Row, ta_label: TypeAdapter) -> Optional[Dict[str, Any]]:
+    """Flatten one Gemini-scored row into the HF export schema."""
+    try:
+        try:
+            labels = ta_label.validate_json(row["gemini_json"])
+        except Exception:
+            payload = json.loads(row["gemini_json"])
+            labels = ta_label.validate_python(payload.get("labels") if isinstance(payload, dict) else payload)
+    except Exception:
+        return None
+    return {
+        "id": row["id"],
+        "text": row["text"],
+        "toxicity_label": row["toxicity_label"],
+        "toxicity_score": row["toxicity_score"],
+        "main_language": labels.main_language,
+        "tatar_prob": labels.tatar_prob,
+        "russian_share": labels.russian_share,
+        "error_share": labels.error_share,
+        "error_density": labels.error_density,
+        "main_error_type": labels.main_error_type,
+        "non_fluent_prob": labels.non_fluent_prob,
+        "meaning_clarity": labels.meaning_clarity,
+        "noise_score": labels.noise_score,
+        "overall_gec_usefulness": labels.overall_gec_usefulness,
+    }
+
+
+def export_hf_parquet_cmd(
+    db_path: Path,
+    output_dir: Path,
+    source_table: str,
+    toxicity_table: str,
+    max_file_size_mb: float,
+    batch_size: int,
+    limit: Optional[int],
+    overwrite: bool,
+    report_name: str = "export_report.json",
+):
+    """Export Gemini labels as HF-friendly split Parquet files."""
+    ensure_parent(db_path)
+    source_table = _validate_table_name(source_table)
+    toxicity_table = _validate_table_name(toxicity_table)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_parts = sorted(output_dir.glob("*.parquet"))
+    report_path = output_dir / report_name
+    if existing_parts and not overwrite:
+        typer.echo(f"Output directory already contains parquet files: {output_dir}")
+        raise typer.Exit(code=1)
+    if overwrite:
+        for part in existing_parts:
+            part.unlink()
+        if report_path.exists():
+            report_path.unlink()
+
+    max_file_size_bytes = max(1, int(max_file_size_mb * 1024 * 1024))
+    batch_size = max(1, int(batch_size))
+    ta_label = TypeAdapter(LabelPayload)
+
+    written = 0
+    skipped_invalid = 0
+    files: List[Dict[str, Any]] = []
+    part_idx = 0
+    writer: Optional[pq.ParquetWriter] = None
+    current_path: Optional[Path] = None
+    current_rows = 0
+    current_estimated_bytes = 0
+
+    def _part_path(idx: int) -> Path:
+        return output_dir / f"train-{idx:05d}.parquet"
+
+    def _open_writer() -> None:
+        nonlocal writer, current_path, current_rows, current_estimated_bytes, part_idx
+        current_path = _part_path(part_idx)
+        writer = pq.ParquetWriter(current_path, HF_EXPORT_SCHEMA, compression="zstd")
+        current_rows = 0
+        current_estimated_bytes = 0
+
+    def _close_writer() -> None:
+        nonlocal writer, current_path, current_rows, current_estimated_bytes, part_idx
+        if writer is None or current_path is None:
+            return
+        writer.close()
+        size = current_path.stat().st_size if current_path.exists() else 0
+        files.append({"path": str(current_path), "rows": current_rows, "bytes": size})
+        writer = None
+        current_path = None
+        current_rows = 0
+        current_estimated_bytes = 0
+        part_idx += 1
+
+    with open_db(db_path) as conn:
+        ensure_gemini_table(conn, source_table)
+        ensure_toxicity_table(conn, toxicity_table)
+        last_rowid = 0
+        rows_seen = 0
+        while True:
+            fetch_limit = batch_size
+            if limit is not None:
+                remaining = int(limit) - rows_seen
+                if remaining <= 0:
+                    break
+                fetch_limit = min(fetch_limit, remaining)
+            rows = conn.execute(
+                f"""
+                SELECT
+                    l.rowid AS __src_rowid__,
+                    l.id,
+                    l.text,
+                    COALESCE(t.toxicity_label, l.toxicity_label) AS toxicity_label,
+                    COALESCE(t.toxicity_score, l.toxicity_score) AS toxicity_score,
+                    l.gemini_json
+                FROM {source_table} AS l
+                JOIN {toxicity_table} AS t ON t.id = l.id
+                WHERE l.rowid > ?
+                  AND l.gemini_json IS NOT NULL
+                  AND l.gemini_json != ''
+                  AND COALESCE(t.toxicity_label, l.toxicity_label, 0) != 1
+                  AND COALESCE(t.gemini_skipped, 0) = 0
+                ORDER BY l.rowid
+                LIMIT ?
+                """,
+                (last_rowid, fetch_limit),
+            ).fetchall()
+            if not rows:
+                break
+
+            last_rowid = int(rows[-1]["__src_rowid__"])
+            rows_seen += len(rows)
+            flat_rows = []
+            for row in rows:
+                flat = _flatten_hf_export_row(row, ta_label)
+                if flat is None:
+                    skipped_invalid += 1
+                    continue
+                flat_rows.append(flat)
+            if not flat_rows:
+                continue
+
+            if writer is None:
+                _open_writer()
+            batch = pa.Table.from_pylist(flat_rows, schema=HF_EXPORT_SCHEMA)
+            writer.write_table(batch)
+            written += len(flat_rows)
+            current_rows += len(flat_rows)
+            current_estimated_bytes += batch.nbytes
+
+            actual_size = current_path.stat().st_size if current_path and current_path.exists() else 0
+            if actual_size >= max_file_size_bytes or current_estimated_bytes >= max_file_size_bytes:
+                _close_writer()
+
+    _close_writer()
+    total_bytes = sum(f["bytes"] for f in files)
+    report = {
+        "source_table": source_table,
+        "toxicity_table": toxicity_table,
+        "rows_written": written,
+        "rows_skipped_invalid_gemini_json": skipped_invalid,
+        "files": files,
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+        "max_file_size_mb": max_file_size_mb,
+        "compression": "zstd",
+    }
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(f"Exported {written} rows to {len(files)} parquet files in {output_dir}")
+    typer.echo(f"Wrote export report to {report_path}")
 
 
 def prepare_import_cmd(

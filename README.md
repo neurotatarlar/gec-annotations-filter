@@ -49,6 +49,12 @@ python -m app.cli gemini --source-table toxicity_segments --output-table llm_seg
 python -m app.cli export-parquet output.parquet
 ```
 
+For a Hugging Face upload with flat Gemini label columns and split Parquet parts:
+```bash
+python -m app.cli export-hf-parquet data/hf_export --max-file-size-mb 512
+# writes data/hf_export/train-00000.parquet, ... plus export_report.json
+```
+
 6) **Prepare annotation batch (JSON)**
 ```bash
 python -m app.cli prepare-import --source-table llm_segments --limit 5000 --output data/import.json

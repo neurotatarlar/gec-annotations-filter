@@ -11,6 +11,7 @@ from .commands import (
     toxicity_cmd,
     gemini_cmd,
     export_parquet_cmd,
+    export_hf_parquet_cmd,
     prepare_import_cmd,
 )
 from .config import DEFAULT_CONFIG
@@ -110,6 +111,30 @@ def export_parquet(
 ):
     """Export a table to a Parquet file."""
     export_parquet_cmd(db_path, output, table)
+
+
+@app.command("export-hf-parquet")
+def export_hf_parquet(
+    output_dir: Path = typer.Argument(..., help="Destination directory for split Parquet files."),
+    db_path: Path = typer.Option(Path("data/pipeline.sqlite"), "--db-path", help="Existing sqlite database."),
+    source_table: str = typer.Option("llm_segments", help="Gemini-scored table to read from."),
+    toxicity_table: str = typer.Option("toxicity_segments", help="Toxicity table used to exclude toxic/skipped rows."),
+    max_file_size_mb: float = typer.Option(512.0, help="Approximate maximum size for each Parquet part."),
+    batch_size: int = typer.Option(2000, help="Rows to read and write per batch."),
+    limit: Optional[int] = typer.Option(None, help="Optional row limit for smoke tests."),
+    overwrite: bool = typer.Option(False, help="Overwrite existing parquet files in the output directory."),
+):
+    """Export Gemini labels as HF-friendly split Parquet files."""
+    export_hf_parquet_cmd(
+        db_path,
+        output_dir,
+        source_table,
+        toxicity_table,
+        max_file_size_mb,
+        batch_size,
+        limit,
+        overwrite,
+    )
 
 
 @app.command("prepare-import")
